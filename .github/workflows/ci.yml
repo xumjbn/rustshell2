@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Check if version changed (compare Cargo.toml with latest tag) ──
+
+  check-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: version
+        run: |
+          VER=$(grep '^version = ' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VER" >> $GITHUB_OUTPUT
+
+          LATEST_TAG=$(git tag --sort=-v:refname | grep '^v' | head -1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No previous tag, creating v$VER"
+            echo "changed=true" >> $GITHUB_OUTPUT
+            git tag "v$VER"
+            git push origin "v$VER"
+            exit 0
+          fi
+
+          LATEST_VER="${LATEST_TAG#v}"
+          if [ "$VER" != "$LATEST_VER" ]; then
+            echo "Version changed: $LATEST_VER -> $VER"
+            echo "changed=true" >> $GITHUB_OUTPUT
+            git tag "v$VER"
+            git push origin "v$VER"
+          else
+            echo "Version unchanged ($VER), skipping release builds"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ── Quick validation (always runs) ────────────────────────────────
+
+  quick-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+
+  # ── Build + release (only if version changed) ─────────────────────
+
+  linux-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cp target/release/rustshell rustshell-v${{ needs.check-version.outputs.version }}-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-linux-x86_64
+          generate_release_notes: true
+          make_latest: true
+
+  linux-arm64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cp target/release/rustshell rustshell-v${{ needs.check-version.outputs.version }}-linux-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-linux-arm64
+
+  macos-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
+      - run: cp target/x86_64-apple-darwin/release/rustshell rustshell-v${{ needs.check-version.outputs.version }}-macos-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-macos-x86_64
+
+  macos-arm64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cp target/release/rustshell rustshell-v${{ needs.check-version.outputs.version }}-macos-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-macos-arm64
+
+  windows-x86_64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: cp target/release/rustshell.exe rustshell-v${{ needs.check-version.outputs.version }}-windows-x86_64.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-windows-x86_64.exe
+
+  windows-arm64:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - name: Install libsodium for ARM64
+        run: |
+          vcpkg install libsodium:arm64-windows
+          echo "SODIUM_LIB_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\arm64-windows\lib" >> $env:GITHUB_ENV
+          echo "SODIUM_INCLUDE_DIR=$env:VCPKG_INSTALLATION_ROOT\installed\arm64-windows\include" >> $env:GITHUB_ENV
+      - run: cargo build --release --target aarch64-pc-windows-msvc
+      - run: cp target/aarch64-pc-windows-msvc/release/rustshell.exe rustshell-v${{ needs.check-version.outputs.version }}-windows-arm64.exe
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          files: rustshell-v${{ needs.check-version.outputs.version }}-windows-arm64.exe

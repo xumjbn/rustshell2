@@ -1,0 +1,278 @@
+// RustShell 需要的线格式定义。
+//
+// 这个文件只描述本客户端**实际用到**的那部分消息，不是上游 proto 的副本：
+// 上游 message.proto 有 985 行、rendezvous.proto 260 行，绝大多数是桌面
+// 远控（视频帧、鼠标键盘、文件传输、录屏）用的，跟远程终端无关。
+//
+// 字段号和类型必须与对端一致，否则一个字节都对不上——这是互操作所要求的
+// 接口事实。消息名和字段名**不出现在 protobuf 线格式里**，只影响本地生成
+// 的 Rust API，所以这里按自己的需要组织。
+//
+// 参考实测（2026-07-30，对真实远端逐条验证）：
+//   * OptionMessage.terminal_persistent(18) 是声明持久会话的唯一开关，
+//     不发这个字段，远端一断开就销毁整个 service。
+//   * 剪贴板图片必须走 MultiClipboards(28) + ImageRgba(21) 且填 width/
+//     height；ImagePng(22) 只落成 "image/png" 格式，不写 CF_DIB。
+
+syntax = "proto3";
+
+package rustshell;
+
+// ─────────────────────────── 信令（rendezvous） ───────────────────────────
+
+// 连接类型。终端会话必须声明 TERMINAL，否则远端按桌面远控处理。
+enum ConnType {
+  DEFAULT_CONN = 0;
+  FILE_TRANSFER = 1;
+  PORT_FORWARD = 2;
+  RDP = 3;
+  VIEW_CAMERA = 4;
+  TERMINAL = 5;
+}
+
+enum NatType {
+  UNKNOWN_NAT = 0;
+  ASYMMETRIC = 1;
+  SYMMETRIC = 2;
+}
+
+// 请求打洞。force_relay = false 才能让信令服务器回对端地址，从而先试直连。
+message PunchHoleRequest {
+  string id = 1;
+  NatType nat_type = 2;
+  string licence_key = 3;
+  ConnType conn_type = 4;
+  string version = 6;
+  bool force_relay = 8;
+}
+
+message PunchHoleResponse {
+  bytes socket_addr = 1;
+  bytes pk = 2;
+  // 失败原因。0 是 ID_NOT_EXIST，所以「有值」不等于「失败」——必须结合
+  // socket_addr 是否为空一起判断。
+  enum Failure {
+    ID_NOT_EXIST = 0;
+    OFFLINE = 2;
+    LICENSE_MISMATCH = 3;
+    LICENSE_OVERUSE = 4;
+  }
+  Failure failure = 3;
+  string relay_server = 4;
+  oneof union {
+    NatType nat_type = 5;
+    bool is_local = 6;
+  }
+  string other_failure = 7;
+}
+
+message RequestRelay {
+  string id = 1;
+  string uuid = 2;
+  bytes socket_addr = 3;
+  string relay_server = 4;
+  bool secure = 5;
+  string licence_key = 6;
+  ConnType conn_type = 7;
+}
+
+message RelayResponse {
+  bytes socket_addr = 1;
+  string uuid = 2;
+  string relay_server = 3;
+  // pk 用于验证对端身份：先用信令服务器公钥验签得到对端签名公钥。
+  oneof union {
+    string id = 4;
+    bytes pk = 5;
+  }
+  string refuse_reason = 6;
+  string version = 7;
+}
+
+// 与信令服务器之间的可选加密握手。
+message KeyExchange {
+  repeated bytes keys = 1;
+}
+
+message RendezvousMessage {
+  oneof union {
+    PunchHoleRequest punch_hole_request = 8;
+    PunchHoleResponse punch_hole_response = 11;
+    RequestRelay request_relay = 18;
+    RelayResponse relay_response = 19;
+    KeyExchange key_exchange = 25;
+  }
+}
+
+// ─────────────────────────── 会话（peer 消息） ───────────────────────────
+
+// 对端用信令服务器公钥签名的身份，验签后得到对端的 box 公钥。
+message SignedId {
+  bytes id = 1;
+}
+
+message IdPk {
+  string id = 1;
+  bytes pk = 2;
+}
+
+// NaCl 密钥交换：非对称部分用于封装，对称密钥用于后续全部流量。
+message PublicKey {
+  bytes asymmetric_value = 1;
+  bytes symmetric_value = 2;
+}
+
+// 口令质询：SHA256(SHA256(password + salt) + challenge)。
+message Hash {
+  string salt = 1;
+  string challenge = 2;
+}
+
+// 只保留终端会话用得到的那一个开关。远端对终端类型的连接会把其余选项全部
+// 剥掉，所以这里也没有保留的意义。
+message OptionMessage {
+  enum BoolOption {
+    NotSet = 0;
+    No = 1;
+    Yes = 2;
+  }
+  BoolOption terminal_persistent = 18;
+}
+
+// service_id 决定接回哪个持久会话。远端把一个 service 的输出广播给所有连到
+// 它的客户端，所以并发窗口必须用不同的 service_id，而不是不同 terminal_id。
+message Terminal {
+  string service_id = 1;
+}
+
+message LoginRequest {
+  string username = 1;
+  bytes password = 2;
+  string my_id = 4;
+  string my_name = 5;
+  OptionMessage option = 6;
+  string version = 11;
+  string my_platform = 13;
+  oneof union {
+    Terminal terminal = 16;
+  }
+}
+
+message PeerInfo {
+  string username = 1;
+  string hostname = 2;
+  string platform = 3;
+  string version = 7;
+}
+
+message LoginResponse {
+  oneof union {
+    string error = 1;
+    PeerInfo peer_info = 2;
+  }
+}
+
+// ─────────────────────────── 终端 ───────────────────────────
+
+message OpenTerminal {
+  int32 terminal_id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+}
+
+message ResizeTerminal {
+  int32 terminal_id = 1;
+  uint32 rows = 2;
+  uint32 cols = 3;
+}
+
+message CloseTerminal {
+  int32 terminal_id = 1;
+}
+
+message TerminalData {
+  int32 terminal_id = 1;
+  bytes data = 2;
+  bool compressed = 3;
+}
+
+message TerminalOpened {
+  int32 terminal_id = 1;
+  bool success = 2;
+  string message = 3;
+  uint32 pid = 4;
+  string service_id = 5;
+  repeated int32 persistent_sessions = 6;
+  // 置位表示紧接着的那一帧 data 是上次会话缓冲输出的回放。那段数据是字节流
+  // 的尾部、从任意位置切断，不能原样写进终端。
+  bool replay_terminal_output = 7;
+}
+
+message TerminalClosed {
+  int32 terminal_id = 1;
+  int32 exit_code = 2;
+}
+
+message TerminalError {
+  int32 terminal_id = 1;
+  string message = 2;
+}
+
+message TerminalAction {
+  oneof union {
+    OpenTerminal open = 1;
+    TerminalData data = 2;
+    ResizeTerminal resize = 3;
+    CloseTerminal close = 4;
+  }
+}
+
+message TerminalResponse {
+  oneof union {
+    TerminalOpened opened = 1;
+    TerminalData data = 2;
+    TerminalClosed closed = 3;
+    TerminalError error = 4;
+  }
+}
+
+// ─────────────────────────── 剪贴板 ───────────────────────────
+
+enum ClipboardFormat {
+  Text = 0;
+  Rtf = 1;
+  Html = 2;
+  ImageRgba = 21;
+  ImagePng = 22;
+  ImageSvg = 23;
+  Special = 31;
+}
+
+message Clipboard {
+  bool compress = 1;
+  bytes content = 2;
+  int32 width = 3;
+  int32 height = 4;
+  ClipboardFormat format = 5;
+  string special_name = 6;
+}
+
+message MultiClipboards {
+  repeated Clipboard clipboards = 1;
+}
+
+// ─────────────────────────── 顶层消息 ───────────────────────────
+
+message Message {
+  oneof union {
+    SignedId signed_id = 3;
+    PublicKey public_key = 4;
+    LoginRequest login_request = 7;
+    LoginResponse login_response = 8;
+    Hash hash = 9;
+    Clipboard clipboard = 16;
+    MultiClipboards multi_clipboards = 28;
+    TerminalAction terminal_action = 31;
+    TerminalResponse terminal_response = 32;
+  }
+}
