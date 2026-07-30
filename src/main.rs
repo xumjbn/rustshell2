@@ -328,19 +328,50 @@ fn detect_scroll(prev: &[String], cur: &[String]) -> usize {
     if rows == 0 || cur.len() != rows {
         return 0;
     }
-    // Long enough that matching it by chance is unlikely, short enough to
-    // still fit after a scroll of most of a screen.
-    let probe = (rows / 3).clamp(2, 8).min(rows);
-    let window = &cur[..probe];
-    // A window of blank or near-blank rows matches almost anywhere.
-    if window.iter().filter(|l| !l.trim().is_empty()).count() < 2 {
-        return 0;
+
+    // 探测窗口取内容最密集的一段，而不是屏幕最顶上那几行。
+    //
+    // 这是实测逼出来的：Claude Code 的布局是顶部一片空白填充、对话在中间、
+    // 状态栏钉在底部。从顶部取窗口，取到的全是空行，「窗口太空就放弃」的
+    // 保护于是把整个检测关掉了——真机上 moved 恒为 0，一行历史都留不下。
+    let window = (rows / 5).clamp(3, 6).min(rows);
+    let substance = |row: &String| {
+        // NUL 是终端填充，算空白；否则一屏 NUL 会被当成有内容。
+        !row.chars().all(|c| c.is_whitespace() || c == '\0')
+    };
+    let score = |slice: &[String]| -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for row in slice.iter().filter(|r| substance(r)) {
+            let t = row.trim();
+            if !seen.contains(&t) {
+                seen.push(t);
+            }
+        }
+        // 只数**不重复**的非空行。重复行（边框、分隔线）到处都能匹配上，
+        // 拿它们当锚点会指向错误的位置。
+        seen.len()
+    };
+
+    // 候选窗口按得分从高到低依次试。只取最高分的那一个不行：得分相同的窗口
+    // 很多，而挑中靠近屏幕底部的那个时，它在上一帧里正好落在固定框上，永远
+    // 匹配不上——实测就是这样让检测失效的。
+    let mut candidates: Vec<usize> = (0..=(rows - window)).collect();
+    candidates.sort_by_key(|&i| std::cmp::Reverse(score(&cur[i..i + window])));
+
+    for at in candidates.into_iter().take(8) {
+        let probe = &cur[at..at + window];
+        if score(probe) < 3 {
+            break;
+        }
+        // 这段内容在上一帧里的位置。当时更靠下，就说明内容整体上移了。
+        if let Some(before) = (0..=(rows - window)).find(|&i| &prev[i..i + window] == probe) {
+            if before > at {
+                return before - at;
+            }
+            // 位置没动或反而更靠上，这个锚点说明不了滚动，换下一个候选。
+        }
     }
-    // Unchanged top means nothing moved, whatever else repeats further down.
-    if window == &prev[..probe] {
-        return 0;
-    }
-    (1..=(rows - probe)).find(|&n| &prev[n..n + probe] == window).unwrap_or(0)
+    0
 }
 
 /// The screen, modelled twice.
@@ -389,8 +420,10 @@ struct Screen {
     status: Option<(String, std::time::Instant)>,
     /// Bytes straight to the terminal, no modelling.
     passthrough: bool,
-    /// vt100 history length as of the last draw.
+    /// vt100 history length as of the last absorb.
     drawn_history: usize,
+    /// 自上次渲染以来退役的行，等着被推进宿主终端的滚动缓冲。
+    pending: Vec<Vec<u8>>,
 }
 
 impl Screen {
@@ -410,6 +443,7 @@ impl Screen {
             status: None,
             passthrough: true,
             drawn_history: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -517,7 +551,46 @@ impl Screen {
             write_stdout(data);
             return;
         }
+        let before = self.drawn_history;
         self.model.process(data);
+        let after = self.vt_history();
+        self.drawn_history = after;
+
+        // 检测与归档必须按帧做，不能等到渲染时刻。
+        //
+        // 模型逐字节处理了每一个中间状态，但两次渲染之间可能经过几十帧；只在
+        // 渲染时刻比较前后快照的话，中间状态就从眼皮底下流走了。实测抓到过一
+        // 次刷新之间屏幕从横幅直接跳到第 41 行——跳了 40 行，30 行的屏幕前后
+        // 零重叠，那 40 行于是永远找不回来。
+        let natural = after.saturating_sub(before);
+        let cur_plain: Vec<String> = self.model.screen().rows(0, self.cols).collect();
+        let moved = if natural > 0 {
+            natural
+        } else {
+            detect_scroll(&self.prev_plain, &cur_plain)
+        };
+
+        if natural > 0 {
+            for index in before..after {
+                let line = self.vt_history_line(after, index);
+                self.pending.push(line);
+            }
+        } else if moved > 0 {
+            let take = moved.min(self.prev_formatted.len());
+            let lines: Vec<Vec<u8>> = self.prev_formatted.iter().take(take).cloned().collect();
+            self.pending.extend(lines);
+        }
+
+        if moved > 0 {
+            log::debug!(
+                "absorb: natural={natural} moved={moved} pending={} hist={}",
+                self.pending.len(),
+                self.history.len()
+            );
+        }
+
+        self.prev_plain = cur_plain;
+        self.prev_formatted = self.model.screen().rows_formatted(0, self.cols).collect();
     }
 
     /// 收下并立刻画出来。等价于 absorb 后紧跟 flush。
@@ -533,56 +606,17 @@ impl Screen {
         if self.passthrough {
             return;
         }
-        // 上一次画的时候的历史长度。中间可能吸收了很多帧。
-        let before = self.drawn_history;
-        let after = self.vt_history();
-        self.drawn_history = after;
         let alt = self.model.screen().alternate_screen();
         let rows = self.rows as usize;
 
-        // Entering the alternate screen discards vt100's history, so the length
-        // falls as well as rises. A plain subtraction underflows, and in release
-        // mode that silently becomes a colossal line count.
-        let natural = after.saturating_sub(before);
-
-        let cur_plain: Vec<String> = self.model.screen().rows(0, self.cols).collect();
-        // In the alternate screen nothing is ever retired, so a scroll can only
-        // be recognised by the content having moved.
-        let moved = if natural > 0 { natural } else { detect_scroll(&self.prev_plain, &cur_plain) };
-
-        // Collect what left the screen, oldest first.
-        let mut retired: Vec<Vec<u8>> = Vec::new();
-        if natural > 0 {
-            // vt100 kept them, which is exact — including lines that came and
-            // went inside this one frame and so never reached the screen.
-            for index in before..after {
-                let line = self.vt_history_line(after, index);
-                retired.push(line);
-            }
-        } else if moved > 0 {
-            // Nothing was retired but the content moved: the alternate screen,
-            // where vt100 keeps no history, so last frame's rows are the record.
-            retired.extend(self.prev_formatted.iter().take(moved).cloned());
-        }
-
-        if log::log_enabled!(log::Level::Debug) && (!retired.is_empty() || alt != self.alt) {
-            log::debug!(
-                "frame: natural={natural} moved={moved} retired={} alt={alt} history={}",
-                retired.len(),
-                self.history.len() + retired.len()
-            );
-        }
-
+        // absorb 已经按帧检测并攒好了退役的行，这里只管画。
+        let retired = std::mem::take(&mut self.pending);
         for line in &retired {
             self.archive(line.clone());
         }
 
-        self.prev_plain = cur_plain;
-        self.prev_formatted = self.model.screen().rows_formatted(0, self.cols).collect();
-
-        // Paged back: keep accumulating, but leave the frozen view alone. The
-        // offset counts back from the live bottom, so it has to grow with the
-        // history or the view slides forward under the user.
+        // 翻页回看时视图冻结，但 offset 从底部往回数，历史一长就得跟着走，
+        // 否则同一个 offset 会指向别的内容。
         if self.offset > 0 {
             if !retired.is_empty() {
                 self.offset = (self.offset + retired.len()).min(self.history.len());
@@ -590,43 +624,26 @@ impl Screen {
             return;
         }
 
-        let mut out: Vec<u8> = Vec::with_capacity(4096);
-
-        // Deliberately *not* mirrored: the alternate screen stays on the remote
-        // side of the glass.
-        //
-        // Putting the local terminal into it costs both of the things this is
-        // for. A terminal keeps no scrollback for the alternate screen, so the
-        // wheel has nothing to show; worse, iTerm2 and Terminal.app send arrow
-        // keys for the wheel while an app is in the alternate screen, so
-        // scrolling starts walking the remote app's input history instead. So
-        // the app gets drawn on the main screen like any other output, and the
-        // lines it scrolls past go into the terminal's real scrollback where the
-        // wheel can reach them.
-        //
-        // The cost is that whatever was on screen before the app started is
-        // overwritten rather than saved and restored. It is still in the
-        // scrollback, which is the trade worth making.
+        // 备用屏幕不镜像到本地：终端不为它保留滚动缓冲，而 iTerm2 和
+        // Terminal.app 在应用处于备用屏幕时会把滚轮发成方向键。整屏切换时
+        // 内容会全变，diff 跨不过去，直接重画。
         if alt != self.alt {
-            // The whole screen changes at once here, so repaint rather than
-            // trusting a diff across the discontinuity.
             self.alt = alt;
             self.repaint(false);
             return;
         }
 
+        let mut out: Vec<u8> = Vec::with_capacity(4096);
         if !retired.is_empty() {
-            // A newline on the last row is the only thing that scrolls a
-            // terminal, and scrolling is the only way a line enters its
-            // scrollback. Rows still on screen carry their own formatting up
-            // with them, so they just need the scroll.
+            // 在最后一行换行是唯一能让终端滚动的办法，而滚动是行进入它自己
+            // 滚动缓冲的唯一途径。还在屏幕上的行会带着自己的格式一起上去，
+            // 所以只需要滚。
             out.extend_from_slice(format!("\x1b[{};1H", self.rows).as_bytes());
             for _ in 0..retired.len().min(rows) {
                 out.extend_from_slice(b"\r\n");
             }
             if retired.len() > rows {
-                // These never reached the terminal, so write each one out
-                // before scrolling it away, or it would enter blank.
+                // 这些从没到过终端，得先写出来再滚走，否则进缓冲是空行。
                 for line in &retired[rows..] {
                     out.extend_from_slice(b"\x1b[2K");
                     out.extend_from_slice(line);
@@ -636,12 +653,10 @@ impl Screen {
         }
         self.emit(&out);
 
-        // Now reconcile the viewport itself.
         let diff = self.model.screen().contents_diff(self.host.screen());
         self.emit(&diff);
 
-        // Redrawn every frame while it lasts, because the remote app paints
-        // over the last row constantly.
+        // 状态行每帧重画，因为远端应用一直在覆盖最后一行。
         if let Some(line) = self.status_line() {
             self.emit(&line);
         } else if self.status.is_some() {
@@ -650,14 +665,6 @@ impl Screen {
         }
     }
 
-    /// Absorb a reconnect replay without echoing it.
-    ///
-    /// The remote hands back the tail of the previous session's byte stream,
-    /// cut at an arbitrary offset: it opens mid-escape-sequence and is full of
-    /// absolute cursor moves that assume a screen we never saw. Writing it out
-    /// shreds the display — and scrolling the terminal once per line it retires
-    /// would bury the real history under a repaint. Feed the model, then paint
-    /// the reconstruction.
     /// 吸收重连回放。返回 true 表示需要请远端重画一次。
     fn feed_replay(&mut self, data: &[u8]) -> bool {
         if self.passthrough {
@@ -1621,6 +1628,79 @@ mod render_tests {
         let prev: Vec<String> = (0..10).map(|i| format!("row{i}")).collect();
         let cur: Vec<String> = (4..14).map(|i| format!("row{i}")).collect();
         assert_eq!(detect_scroll(&prev, &cur), 4);
+    }
+
+    /// Claude Code's shape: blank padding at the top, the conversation in the
+    /// middle, a fixed box pinned to the bottom.
+    fn tui_screen(first_line: usize) -> Vec<String> {
+        let mut rows: Vec<String> = Vec::new();
+        for _ in 0..6 {
+            rows.push(String::new());
+        }
+        for i in first_line..first_line + 16 {
+            rows.push(format!("  conversation line {i}"));
+        }
+        rows.push("─────────────────────────".into());
+        rows.push("> ".into());
+        rows.push("  bypass permissions on (shift+tab to cycle)".into());
+        rows.push(String::new());
+        rows
+    }
+
+    #[test]
+    fn a_scroll_is_found_when_the_top_of_the_screen_is_blank() {
+        // The case that made the detector useless in practice: probing the top
+        // rows finds only padding, so the "too empty to trust" guard fired and
+        // detection never ran at all. Real sessions logged moved=0 forever.
+        let prev = tui_screen(1);
+        let cur = tui_screen(4);
+        assert_eq!(prev.len(), cur.len());
+        assert!(prev[..6].iter().all(|r| r.trim().is_empty()), "top must be blank");
+        assert_eq!(detect_scroll(&prev, &cur), 3);
+    }
+
+    #[test]
+    fn nul_padding_counts_as_blank() {
+        // A terminal pads with NUL, which is not whitespace; without treating it
+        // as blank, a screen of padding looks like content.
+        let mut prev = tui_screen(1);
+        let mut cur = tui_screen(2);
+        for rows in [&mut prev, &mut cur] {
+            for i in 0..6 {
+                rows[i] = "\0\0\0\0".into();
+            }
+        }
+        assert_eq!(detect_scroll(&prev, &cur), 1);
+    }
+
+    #[test]
+    fn repeated_chrome_does_not_anchor_the_search() {
+        // Borders and separators repeat all over a TUI. Anchoring on them points
+        // at the wrong place, so the probe is scored on distinct rows only.
+        let mut prev: Vec<String> = vec!["────".into(); 20];
+        let mut cur: Vec<String> = vec!["────".into(); 20];
+        prev[10] = "unique alpha".into();
+        prev[11] = "unique beta".into();
+        prev[12] = "unique gamma".into();
+        cur[8] = "unique alpha".into();
+        cur[9] = "unique beta".into();
+        cur[10] = "unique gamma".into();
+        assert_eq!(detect_scroll(&prev, &cur), 2);
+    }
+
+    #[test]
+    fn a_screen_that_did_not_move_reports_nothing() {
+        let screen = tui_screen(1);
+        assert_eq!(detect_scroll(&screen, &screen), 0);
+    }
+
+    #[test]
+    fn content_moving_down_is_not_a_scroll() {
+        // Only upward movement retires lines. Downward means the app redrew
+        // lower, and nothing left the screen.
+        let prev = tui_screen(4);
+        let cur = tui_screen(1);
+        assert_eq!(detect_scroll(&prev, &cur), 0);
     }
 
     #[test]
