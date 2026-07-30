@@ -458,6 +458,11 @@ impl Screen {
         self.emit(&bytes);
     }
 
+    /// 是否在建模渲染。直通模式下很多处理没有意义，甚至有害。
+    fn renders(&self) -> bool {
+        !self.passthrough
+    }
+
     #[cfg(test)]
     fn history_len(&self) -> usize {
         self.history.len()
@@ -664,6 +669,10 @@ impl Screen {
             // 但丢完屏幕上就什么都没有了——重连时的画面本来全靠这段回放。
             // 所以要请远端重画一次，否则连提示符都看不到。
             let _ = data;
+            // 清屏，并说清楚发生了什么。留一片空白让人自己猜是最糟的选择。
+            write_stdout(b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[0m\x1b[H\x1b[2J");
+            let notice = "[rustshell] 已接回会话，已丢弃远端回放（那是上次会话的残片）。\r\n[rustshell] 正在请远端重画；若仍为空白，按一下回车。\r\n\r\n";
+            write_stdout(notice.as_bytes());
             return true;
         }
         self.model.process(data);
@@ -1945,7 +1954,13 @@ async fn terminal_io_loop(
                                 // treatment: it is the point where the terminal
                                 // still carries our connection logs, and the
                                 // renderer needs a screen it knows the state of.
-                                if expect_replay || first_frame {
+                                // first_frame 只对渲染模式有意义——它需要一个
+                                // 已知状态的屏幕作为 diff 的起点。直通模式没有
+                                // 模型，走这条分支只会把第一帧（里面正是 shell
+                                // 的初始提示符）白白丢掉。
+                                let treat_as_replay =
+                                    expect_replay || (first_frame && screen.renders());
+                                if treat_as_replay {
                                     expect_replay = false;
                                     first_frame = false;
                                     if screen.feed_replay(&output) {
@@ -1964,6 +1979,7 @@ async fn terminal_io_loop(
                                         conn.send(&m).await.ok();
                                     }
                                 } else {
+                                    first_frame = false;
                                     // 只吸收，不画。画的时机由下面的定时器在
                                     // 字节流静下来之后决定——半张重绘不能拿去
                                     // 做滚动检测。
