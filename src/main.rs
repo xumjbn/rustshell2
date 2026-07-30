@@ -950,7 +950,7 @@ fn main() {
         let outcome = rt.block_on(run(
             args.id.clone(), args.key.clone(), args.server.clone(), args.port,
             password.clone(), args.quit_key, service_id.clone(), &slot,
-            log_path.clone(), args.detach, args.render,
+            log_path.clone(), args.detach, args.render, args.new_session,
         ));
         let _ = crossterm::terminal::disable_raw_mode();
 
@@ -983,7 +983,7 @@ async fn run(
     device_id: String, licence_key: String,
     server: String, port: u16, password: String,
     quit_key: char, service_id: String, slot: &TerminalSlot,
-    log_path: Option<std::path::PathBuf>, detach: bool, render: bool,
+    log_path: Option<std::path::PathBuf>, detach: bool, render: bool, new_session: bool,
 ) -> Result<SessionEnd> {
     let rendezvous_addr = format!("{}:{}", server, port);
     log::info!("Connecting to rendezvous server {}...", rendezvous_addr);
@@ -1172,7 +1172,7 @@ async fn run(
     }
 
     // Phase 6: Terminal I/O
-    terminal_io_loop(&mut conn, &remote_platform, quit_key, render, slot, log_path, detach).await
+    terminal_io_loop(&mut conn, &remote_platform, quit_key, render, new_session, slot, log_path, detach).await
 }
 
 // ── secure_tcp ─────────────────────────────────────────────────────
@@ -1928,7 +1928,7 @@ fn claim_lock(path: &std::path::Path) -> bool {
 // ── Terminal I/O loop ──────────────────────────────────────────────
 
 async fn terminal_io_loop(
-    conn: &mut Link, remote_platform: &str, quit_key: char, render: bool,
+    conn: &mut Link, remote_platform: &str, quit_key: char, render: bool, new_session: bool,
     slot: &TerminalSlot, log_path: Option<std::path::PathBuf>, detach: bool,
 ) -> Result<SessionEnd> {
     let mut session_log = match log_path {
@@ -2046,12 +2046,17 @@ async fn terminal_io_loop(
                                 // treatment: it is the point where the terminal
                                 // still carries our connection logs, and the
                                 // renderer needs a screen it knows the state of.
-                                // first_frame 只对渲染模式有意义——它需要一个
-                                // 已知状态的屏幕作为 diff 的起点。直通模式没有
-                                // 模型，走这条分支只会把第一帧（里面正是 shell
-                                // 的初始提示符）白白丢掉。
-                                let treat_as_replay =
-                                    expect_replay || (first_frame && screen.renders());
+                                // 接回会话时，第一帧一律当回放，不管远端有没有
+                                // 置 replay_terminal_output。
+                                //
+                                // 实测这台远端会发回放却不置标志位。信了标志位
+                                // 的结果是：那段旧会话的流水被原样写进终端，而且
+                                // 因为缓冲内容不变，每次重连都乱得一模一样。
+                                //
+                                // 全新会话（-n）不能这么做——那一帧是 shell 的
+                                // 初始输出，丢了就真没了。
+                                let treat_as_replay = expect_replay
+                                    || (first_frame && (!new_session || screen.renders()));
                                 if treat_as_replay {
                                     expect_replay = false;
                                     first_frame = false;
