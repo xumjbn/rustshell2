@@ -387,6 +387,8 @@ struct Screen {
     status: Option<(String, std::time::Instant)>,
     /// Bytes straight to the terminal, no modelling.
     passthrough: bool,
+    /// vt100 history length as of the last draw.
+    drawn_history: usize,
 }
 
 impl Screen {
@@ -405,6 +407,7 @@ impl Screen {
             alt: false,
             status: None,
             passthrough: true,
+            drawn_history: 0,
         }
     }
 
@@ -497,14 +500,36 @@ impl Screen {
     }
 
     /// Absorb remote output and update the terminal.
-    fn feed(&mut self, data: &[u8]) {
+    /// 收下字节，先不画。
+    ///
+    /// ConPTY 会把一屏重绘拆成好几个 Data 帧发过来。收一帧画一帧的话，滚动
+    /// 检测会在重绘只完成一半时命中，被推进滚动缓冲的就是画了一半的行——历史
+    /// 里于是全是某一行的前缀，看着像是被截断了。
+    fn absorb(&mut self, data: &[u8]) {
         if self.passthrough {
             write_stdout(data);
             return;
         }
-        let before = self.vt_history();
         self.model.process(data);
+    }
+
+    /// 收下并立刻画出来。等价于 absorb 后紧跟 flush。
+    fn feed(&mut self, data: &[u8]) {
+        self.absorb(data);
+        self.flush();
+    }
+
+    /// 把模型当前的状态画到终端上。
+    ///
+    /// 与 absorb 分开，是为了只在一次重绘完整落地之后才做滚动检测。
+    fn flush(&mut self) {
+        if self.passthrough {
+            return;
+        }
+        // 上一次画的时候的历史长度。中间可能吸收了很多帧。
+        let before = self.drawn_history;
         let after = self.vt_history();
+        self.drawn_history = after;
         let alt = self.model.screen().alternate_screen();
         let rows = self.rows as usize;
 
@@ -1831,6 +1856,13 @@ async fn terminal_io_loop(
     let mut locale_injected = false;
     let mut expect_replay = false;
     let mut first_frame = true;
+    // 第一批未画出数据的时刻，以及最近一批的时刻。
+    let mut pending_since: Option<std::time::Instant> = None;
+    let mut last_data = std::time::Instant::now();
+    // 静默这么久就认为一次重绘的分片已经到齐了。
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(12);
+    // 但输出不停的时候永远等不到静默，所以再给一个强制上限，否则屏幕会冻住。
+    const MAX_HOLD: std::time::Duration = std::time::Duration::from_millis(60);
     let mut last_cols = cols;
     let mut last_rows = rows;
 
@@ -1913,7 +1945,12 @@ async fn terminal_io_loop(
                                     first_frame = false;
                                     screen.feed_replay(&output);
                                 } else {
-                                    screen.feed(&output);
+                                    // 只吸收，不画。画的时机由下面的定时器在
+                                    // 字节流静下来之后决定——半张重绘不能拿去
+                                    // 做滚动检测。
+                                    screen.absorb(&output);
+                                    last_data = std::time::Instant::now();
+                                    pending_since.get_or_insert(last_data);
                                 }
                                 if let Some(l) = session_log.as_mut() { l.append(&output); }
                             }
@@ -1931,6 +1968,13 @@ async fn terminal_io_loop(
             }
 
             _ = input_timer.tick() => {
+                if let Some(since) = pending_since {
+                    if last_data.elapsed() >= SETTLE || since.elapsed() >= MAX_HOLD {
+                        screen.flush();
+                        pending_since = None;
+                    }
+                }
+
                 if let Ok((nc, nr)) = crossterm::terminal::size() {
                     if (nc != last_cols || nr != last_rows) && terminal_opened {
                         log::debug!("Resize: {}x{}", nc, nr);
