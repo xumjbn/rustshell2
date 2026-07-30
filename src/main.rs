@@ -651,7 +651,8 @@ impl Screen {
     /// shreds the display — and scrolling the terminal once per line it retires
     /// would bury the real history under a repaint. Feed the model, then paint
     /// the reconstruction.
-    fn feed_replay(&mut self, data: &[u8]) {
+    /// 吸收重连回放。返回 true 表示需要请远端重画一次。
+    fn feed_replay(&mut self, data: &[u8]) -> bool {
         if self.passthrough {
             // 丢掉，不要写终端。
             //
@@ -659,14 +660,18 @@ impl Screen {
             // 会话的残骸和大量假定了某个屏幕状态的绝对光标定位。原样倒进终端
             // 就是一屏乱码，而且因为缓冲内容不变，每次重连都乱得一模一样。
             // 直通模式没有屏幕模型可以拿它去重建，那就只能不要。
+            //
+            // 但丢完屏幕上就什么都没有了——重连时的画面本来全靠这段回放。
+            // 所以要请远端重画一次，否则连提示符都看不到。
             let _ = data;
-            return;
+            return true;
         }
         self.model.process(data);
         self.model.set_scrollback(0);
         self.prev_plain = self.model.screen().rows(0, self.cols).collect();
         self.prev_formatted = self.model.screen().rows_formatted(0, self.cols).collect();
         self.repaint(true);
+        false
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -1943,7 +1948,21 @@ async fn terminal_io_loop(
                                 if expect_replay || first_frame {
                                     expect_replay = false;
                                     first_frame = false;
-                                    screen.feed_replay(&output);
+                                    if screen.feed_replay(&output) {
+                                        // Ctrl+L 是「重画」的通用约定，shell
+                                        // 和全屏应用都认。比发回车安全——回车
+                                        // 会被当成一次输入提交。
+                                        let mut a = TerminalAction::new();
+                                        a.set_data(TerminalData {
+                                            terminal_id,
+                                            data: vec![0x0c].into(),
+                                            compressed: false,
+                                            ..Default::default()
+                                        });
+                                        let mut m = Message::new();
+                                        m.set_terminal_action(a);
+                                        conn.send(&m).await.ok();
+                                    }
                                 } else {
                                     // 只吸收，不画。画的时机由下面的定时器在
                                     // 字节流静下来之后决定——半张重绘不能拿去
