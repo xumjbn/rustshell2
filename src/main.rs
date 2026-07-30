@@ -2033,6 +2033,7 @@ async fn terminal_io_loop(
                         last_cols = nc; last_rows = nr;
                     }
                 }
+                let mut typed: Vec<u8> = Vec::new();
                 while let Some(input) = poll_input() {
                     let ev = match input {
                         Input::Key(k) => k,
@@ -2130,6 +2131,18 @@ async fn terminal_io_loop(
                         // core and drops off the rendezvous server entirely
                         // ("remote device is offline"). An explicit CloseTerminal
                         // is the path the server cleans up properly.
+                        if terminal_opened && !typed.is_empty() {
+                            let mut a = TerminalAction::new();
+                            a.set_data(TerminalData {
+                                terminal_id,
+                                data: std::mem::take(&mut typed).into(),
+                                compressed: false,
+                                ..Default::default()
+                            });
+                            let mut m = Message::new();
+                            m.set_terminal_action(a);
+                            conn.send(&m).await.ok();
+                        }
                         if detach {
                             log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
                         } else {
@@ -2143,12 +2156,23 @@ async fn terminal_io_loop(
                         }
                         return Ok(SessionEnd::UserQuit);
                     }
-                    if terminal_opened {
-                        let mut a = TerminalAction::new();
-                        a.set_data(TerminalData { terminal_id, data: data.into(), compressed: false, ..Default::default() });
-                        let mut m = Message::new(); m.set_terminal_action(a);
-                        conn.send(&m).await.ok();
-                    }
+                    // 攒起来，本轮结束一次发完。一个按键一条消息的话，打字
+                    // 快一点就是几十条消息背靠背挤过中继——实测会丢字，表现
+                    // 为「敲不进去」。
+                    typed.extend_from_slice(&data);
+                }
+
+                if terminal_opened && !typed.is_empty() {
+                    let mut a = TerminalAction::new();
+                    a.set_data(TerminalData {
+                        terminal_id,
+                        data: std::mem::take(&mut typed).into(),
+                        compressed: false,
+                        ..Default::default()
+                    });
+                    let mut m = Message::new();
+                    m.set_terminal_action(a);
+                    conn.send(&m).await.ok();
                 }
             }
         }
