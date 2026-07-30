@@ -49,6 +49,8 @@ struct Args {
     #[arg(long, default_value = "false")] no_reconnect: bool,
     /// Draw from a screen model, giving native scrollback and the pager
     #[arg(long, default_value = "false")] render: bool,
+    /// 读一次本地剪贴板并报告结果，不连接。用于定位 Ctrl+V 不生效是哪一环。
+    #[arg(long, default_value = "false")] clipboard_check: bool,
 }
 
 /// Why a session ended — decides whether reconnecting makes sense.
@@ -879,6 +881,16 @@ fn main() {
     if args.slot.is_none() { if let Ok(v) = std::env::var("RUSTSHELL_SLOT") { if let Ok(n) = v.parse() { args.slot = Some(n); } } }
     if !args.render { args.render = std::env::var("RUSTSHELL_RENDER").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
     if !args.no_reconnect { args.no_reconnect = std::env::var("RUSTSHELL_NO_RECONNECT").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
+
+    if args.clipboard_check {
+        match clipboard_image_message() {
+            Ok((_, bytes, w, h)) => {
+                println!("clipboard: 图片 {w}x{h}，压缩后 {bytes} 字节，可以发送");
+            }
+            Err(e) => println!("clipboard: 读不到图片 —— {e:#}"),
+        }
+        return;
+    }
 
     if args.id.is_empty() { eprintln!("Error: --id or RUSTSHELL_ID is required"); std::process::exit(1); }
     if args.server.is_empty() { eprintln!("Error: --server or RUSTSHELL_SERVER is required"); std::process::exit(1); }
