@@ -628,7 +628,13 @@ impl Screen {
     /// the reconstruction.
     fn feed_replay(&mut self, data: &[u8]) {
         if self.passthrough {
-            write_stdout(data);
+            // 丢掉，不要写终端。
+            //
+            // 回放是上次会话字节流的最后 8KB，从任意位置切断，里面是一段旧
+            // 会话的残骸和大量假定了某个屏幕状态的绝对光标定位。原样倒进终端
+            // 就是一屏乱码，而且因为缓冲内容不变，每次重连都乱得一模一样。
+            // 直通模式没有屏幕模型可以拿它去重建，那就只能不要。
+            let _ = data;
             return;
         }
         self.model.process(data);
