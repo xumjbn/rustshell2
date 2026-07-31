@@ -91,7 +91,11 @@ fn stable_service_id(device_id: &str) -> String {
 
 /// zstd 压缩。对端按 `compress` 标志决定是否解压，级别随意。
 fn zstd_compress(data: &[u8]) -> Vec<u8> {
-    zstd::encode_all(data, 3).unwrap_or_default()
+    // 用 bulk 而不是 encode_all。两者都产出 zstd 帧，但 bulk 事先知道原始
+    // 长度、会把它写进帧头；encode_all 是流式的，不写。实测对端解不开后者
+    // 的大帧——小的能过，131KB 的过不去，而同样大小不压缩直接发反而没事。
+    // 对端解压失败时返回空数据，于是长度对不上被静默丢弃，什么都不会说。
+    zstd::bulk::compress(data, 3).unwrap_or_default()
 }
 
 /// zstd 解压。解不开就当空数据——一帧坏了不值得断开整个会话。
@@ -337,9 +341,13 @@ fn synthetic_clipboard_image(spec: &str) -> Result<(Message, usize, u32, u32)> {
         .split_once(['x', 'X'])
         .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
         .ok_or_else(|| anyhow::anyhow!("expected WxH, got {spec:?}"))?;
+    // 用一段不可压缩的图案，否则纯色图压缩后只剩几十字节，测不到大载荷。
     let mut bytes = Vec::with_capacity(w * h * 4);
+    let mut state: u32 = 0x1234_5678;
     for _ in 0..(w * h) {
-        bytes.extend_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let b = state.to_le_bytes();
+        bytes.extend_from_slice(&[b[0], b[1], b[2], 0xff]);
     }
     build_clipboard_image(&bytes, w, h)
 }
@@ -2225,7 +2233,13 @@ async fn terminal_io_loop(
                         && ev.modifiers.contains(KeyModifiers::CONTROL)
                         && terminal_opened
                     {
-                        match clipboard_image_message() {
+                        // 诊断用：让 Ctrl+V 走合成图，把「会话进行中发送」这个
+                        // 变量单独隔离出来测。
+                        let built = match std::env::var("RUSTSHELL_CLIP_TEST") {
+                            Ok(spec) => synthetic_clipboard_image(&spec),
+                            Err(_) => clipboard_image_message(),
+                        };
+                        match built {
                             Ok((m, bytes, w, h)) => {
                                 log::debug!("clipboard image {w}x{h}, {bytes} bytes compressed");
                                 if let Err(e) = conn.send(&m).await {
