@@ -2056,7 +2056,13 @@ async fn terminal_io_loop(
                                 // repaint scrolls it into the terminal's own
                                 // scrollback, where it stays readable.
                                 if let Ok(spec) = std::env::var("RUSTSHELL_CLIP_TEST") {
-                                    match synthetic_clipboard_image(&spec) {
+                                    // spec 为 real 时读真实剪贴板，否则按 WxH 合成。
+                                    let built = if spec == "real" {
+                                        clipboard_image_message()
+                                    } else {
+                                        synthetic_clipboard_image(&spec)
+                                    };
+                                    match built {
                                         Ok((m, bytes, w, h)) => {
                                             log::info!("cliptest: sending {w}x{h}, {bytes} bytes on the wire");
                                             match conn.send(&m).await {
