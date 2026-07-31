@@ -667,27 +667,32 @@ impl Screen {
 
     /// 吸收重连回放。返回 true 表示需要请远端重画一次。
     fn feed_replay(&mut self, data: &[u8]) -> bool {
-        if self.passthrough {
-            // 丢掉，不要写终端。
-            //
-            // 回放是上次会话字节流的最后 8KB，从任意位置切断，里面是一段旧
-            // 会话的残骸和大量假定了某个屏幕状态的绝对光标定位。原样倒进终端
-            // 就是一屏乱码，而且因为缓冲内容不变，每次重连都乱得一模一样。
-            // 直通模式没有屏幕模型可以拿它去重建，那就只能不要。
-            //
-            // 但丢完屏幕上就什么都没有了——重连时的画面本来全靠这段回放。
-            // 所以要请远端重画一次，否则连提示符都看不到。
-            let _ = data;
-            // 清屏，并说清楚发生了什么。留一片空白让人自己猜是最糟的选择。
-            write_stdout(b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[0m\x1b[H\x1b[2J");
-            let notice = "[rustshell] 已接回会话，已丢弃远端回放（那是上次会话的残片）。\r\n[rustshell] 正在请远端重画；若仍为空白，按一下回车。\r\n\r\n";
-            write_stdout(notice.as_bytes());
-            return true;
-        }
+        // 回放一律先过屏幕模型，直通模式也不例外。
+        //
+        // 那段字节流是流水账——上次会话最后 8KB 的原始输出，从任意位置切断，
+        // 里面有多个历史提示符、跑过又退出的程序的残迹，以及大量假定了某个
+        // 屏幕状态的绝对光标定位。原样倒进终端就是一坨；因为远端缓冲内容不变，
+        // 每次重连还乱得一模一样。
+        //
+        // 但它本身就是终端指令序列：让 vt100 跑一遍，得到的就是「这个会话现在
+        // 的屏幕」。画那一屏，而不是画流水账，也不是丢掉——丢掉的话，会话里
+        // 如果正跑着全屏应用，你会连它的界面都看不到。
         self.model.process(data);
         self.model.set_scrollback(0);
         self.prev_plain = self.model.screen().rows(0, self.cols).collect();
         self.prev_formatted = self.model.screen().rows_formatted(0, self.cols).collect();
+
+        if self.passthrough {
+            // 直通模式没有宿主模型，所以这里直接写：先把终端清成已知状态，
+            // 再画出重建的这一屏。之后的实时输出接着这个画面往下走。
+            let mut out: Vec<u8> = Vec::with_capacity(8192);
+            out.extend_from_slice(b"\x1b[?1049l\x1b[?7h\x1b[r\x1b[0m\x1b[H\x1b[2J");
+            out.extend_from_slice(&self.model.screen().contents_formatted());
+            write_stdout(&out);
+            // 重建出来的画面就是当前状态，不需要再请远端重画。
+            return false;
+        }
+
         self.repaint(true);
         false
     }
