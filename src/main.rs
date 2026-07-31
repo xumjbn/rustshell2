@@ -289,25 +289,39 @@ const SCROLLBACK_LINES: usize = 10_000;
 fn clipboard_image_message() -> Result<(Message, usize, u32, u32)> {
     let mut clipboard = arboard::Clipboard::new().context("open the local clipboard")?;
     let image = clipboard.get_image().context("no image on the local clipboard")?;
-    let (w, h) = (image.width, image.height);
+    build_clipboard_image(&image.bytes, image.width, image.height)
+}
+
+/// 把一张 RGBA 图装进剪贴板消息。
+///
+/// 与读剪贴板分开，是为了让不带剪贴板的机器（比如无头 Linux）也能测这条
+/// 消息构造路径——测的必须是同一段代码，否则测了等于没测。
+fn build_clipboard_image(bytes: &[u8], w: usize, h: usize) -> Result<(Message, usize, u32, u32)> {
     if w == 0 || h == 0 {
         bail!("clipboard image has no size ({w}x{h})");
     }
-    // A screenshot is already ~15 MB as raw RGBA; anything past this is a
-    // mistake we should not spend a minute of the user's link on.
+    // 一张截图裸 RGBA 就有约 15 MB，超过这个数只可能是搞错了，不值得占用
+    // 用户一分钟的链路。
     const MAX_RAW: usize = 128 * 1024 * 1024;
-    if image.bytes.len() > MAX_RAW {
-        bail!("clipboard image is {} bytes, too large to send", image.bytes.len());
+    if bytes.len() > MAX_RAW {
+        bail!("clipboard image is {} bytes, too large to send", bytes.len());
+    }
+    if bytes.len() != w * h * 4 {
+        bail!("RGBA length {} does not match {w}x{h}", bytes.len());
     }
 
     let mut entry = Clipboard::new();
     entry.format = ClipboardFormat::ImageRgba.into();
     entry.width = w as i32;
     entry.height = h as i32;
-    // Raw RGBA is bulky and compresses well; the receiver decompresses whenever
-    // the flag is set, whatever the format.
-    entry.content = zstd_compress(&image.bytes).into();
-    entry.compress = true;
+    // 压缩是可疑环节之一，留一个开关便于二分。
+    if std::env::var("RUSTSHELL_CLIP_NOCOMPRESS").is_ok() {
+        entry.content = bytes.to_vec().into();
+        entry.compress = false;
+    } else {
+        entry.content = zstd_compress(bytes).into();
+        entry.compress = true;
+    }
     let sent = entry.content.len();
 
     let mut clipboards = MultiClipboards::new();
@@ -315,6 +329,19 @@ fn clipboard_image_message() -> Result<(Message, usize, u32, u32)> {
     let mut msg = Message::new();
     msg.set_multi_clipboards(clipboards);
     Ok((msg, sent, w as u32, h as u32))
+}
+
+/// 合成一张纯色 RGBA，用于在没有剪贴板的机器上测消息构造与发送。
+fn synthetic_clipboard_image(spec: &str) -> Result<(Message, usize, u32, u32)> {
+    let (w, h) = spec
+        .split_once(['x', 'X'])
+        .and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?)))
+        .ok_or_else(|| anyhow::anyhow!("expected WxH, got {spec:?}"))?;
+    let mut bytes = Vec::with_capacity(w * h * 4);
+    for _ in 0..(w * h) {
+        bytes.extend_from_slice(&[0xff, 0x00, 0x00, 0xff]);
+    }
+    build_clipboard_image(&bytes, w, h)
 }
 
 /// Spot a repaint that is really a scroll.
@@ -2020,6 +2047,18 @@ async fn terminal_io_loop(
                                 // corrupts the display; here the first frame's
                                 // repaint scrolls it into the terminal's own
                                 // scrollback, where it stays readable.
+                                if let Ok(spec) = std::env::var("RUSTSHELL_CLIP_TEST") {
+                                    match synthetic_clipboard_image(&spec) {
+                                        Ok((m, bytes, w, h)) => {
+                                            log::info!("cliptest: sending {w}x{h}, {bytes} bytes on the wire");
+                                            match conn.send(&m).await {
+                                                Ok(()) => log::info!("cliptest: sent"),
+                                                Err(e) => log::error!("cliptest: send failed: {e}"),
+                                            }
+                                        }
+                                        Err(e) => log::error!("cliptest: {e:#}"),
+                                    }
+                                }
                                 if !locale_injected {
                                     locale_injected = true;
                                     let hint = if remote_platform.eq_ignore_ascii_case("Windows") {
