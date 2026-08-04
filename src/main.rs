@@ -2297,6 +2297,20 @@ async fn terminal_io_loop(
                             }
                             Some(Union::Closed(c)) => {
                                 log::info!("Terminal closed (exit code: {})", c.exit_code);
+                                // shell 自己退出了也要告诉服务端销毁这个会话。
+                                //
+                                // 会话是持久的（terminal_persistent），只收到 Closed 就
+                                // 走人的话，远端会留下一具「shell 已死、服务端仍登记着」
+                                // 的空壳。下次不带 -n 重连正好接回它，拿到的是上次退出前
+                                // 那一屏回放，之后再没有任何输出——看起来就是卡死在上次
+                                // exit 的地方。
+                                if terminal_opened {
+                                    let mut a = TerminalAction::new();
+                                    a.set_close(CloseTerminal { terminal_id, ..Default::default() });
+                                    let mut m = Message::new();
+                                    m.set_terminal_action(a);
+                                    conn.send(&m).await.ok();
+                                }
                                 return Ok(SessionEnd::RemoteClosed);
                             }
                             Some(Union::Error(e)) => bail!("Terminal error: {}", e.message),
