@@ -459,6 +459,10 @@ struct Screen {
     drawn_history: usize,
     /// 自上次渲染以来退役的行，等着被推进宿主终端的滚动缓冲。
     pending: Vec<Vec<u8>>,
+    /// 本帧内 vt100 自己增长出来的历史行数。
+    ///
+    /// 它精确且与分片无关，所以照旧按分片累计；启发式检测则要等整帧落地。
+    natural_in_frame: usize,
 }
 
 impl Screen {
@@ -479,6 +483,7 @@ impl Screen {
             passthrough: true,
             drawn_history: 0,
             pending: Vec::new(),
+            natural_in_frame: 0,
         }
     }
 
@@ -591,39 +596,52 @@ impl Screen {
         let after = self.vt_history();
         self.drawn_history = after;
 
-        // 检测与归档必须按帧做，不能等到渲染时刻。
-        //
-        // 模型逐字节处理了每一个中间状态，但两次渲染之间可能经过几十帧；只在
-        // 渲染时刻比较前后快照的话，中间状态就从眼皮底下流走了。实测抓到过一
-        // 次刷新之间屏幕从横幅直接跳到第 41 行——跳了 40 行，30 行的屏幕前后
-        // 零重叠，那 40 行于是永远找不回来。
+        // vt100 自己长出来的历史是精确的，而且与分片无关：这些行确实被推出了
+        // 屏幕。照旧按分片归档。
         let natural = after.saturating_sub(before);
-        let cur_plain: Vec<String> = self.model.screen().rows(0, self.cols).collect();
-        let moved = if natural > 0 {
-            natural
-        } else {
-            detect_scroll(&self.prev_plain, &cur_plain)
-        };
-
         if natural > 0 {
             for index in before..after {
                 let line = self.vt_history_line(after, index);
                 self.pending.push(line);
             }
-        } else if moved > 0 {
-            let take = moved.min(self.prev_formatted.len());
-            let lines: Vec<Vec<u8>> = self.prev_formatted.iter().take(take).cloned().collect();
-            self.pending.extend(lines);
-        }
-
-        if moved > 0 {
+            self.natural_in_frame += natural;
             log::debug!(
-                "absorb: natural={natural} moved={moved} pending={} hist={}",
+                "absorb: natural={natural} pending={} hist={}",
                 self.pending.len(),
                 self.history.len()
             );
         }
+        // 启发式检测不在这里做——见 detect_retired。
+    }
 
+    /// 整帧落地之后再判断有没有发生「重绘式滚动」。
+    ///
+    /// 这件事**不能**按网络分片做。一次重绘会被切成好几块，中间态是「新行盖在
+    /// 上面、旧行还留在下面」的混合屏——它照样能锚上，于是把没退役的行也归了
+    /// 档，并把基准推到这张半成品；下一块补完后又检测出一次位移，同一批行被归
+    /// 档两次。归档的行会被滚进终端缓冲、diff 又把它们画回屏幕，回滚里于是出现
+    /// 重复的块。实测在 10 行屏上按字节遍历切分点，能稳定复现出退役 6 行而不是
+    /// 3 行。
+    ///
+    /// 所以检测只在帧边界跑，和渲染共用同一个静默判定。原先把它放在分片里，是
+    /// 为了不漏掉两次渲染之间的中间态；那个顾虑由上面的 natural 兜住——真正把
+    /// 行顶出屏幕的滚动都会体现为 vt100 的历史增长，与分片无关。
+    fn detect_retired(&mut self) {
+        let cur_plain: Vec<String> = self.model.screen().rows(0, self.cols).collect();
+        if self.natural_in_frame == 0 {
+            let moved = detect_scroll(&self.prev_plain, &cur_plain);
+            if moved > 0 {
+                let take = moved.min(self.prev_formatted.len());
+                let lines: Vec<Vec<u8>> = self.prev_formatted.iter().take(take).cloned().collect();
+                self.pending.extend(lines);
+                log::debug!(
+                    "frame: moved={moved} pending={} hist={}",
+                    self.pending.len(),
+                    self.history.len()
+                );
+            }
+        }
+        self.natural_in_frame = 0;
         self.prev_plain = cur_plain;
         self.prev_formatted = self.model.screen().rows_formatted(0, self.cols).collect();
     }
@@ -641,10 +659,13 @@ impl Screen {
         if self.passthrough {
             return;
         }
+        // 到这里这一帧才算完整，检测放在这里做。
+        self.detect_retired();
+
         let alt = self.model.screen().alternate_screen();
         let rows = self.rows as usize;
 
-        // absorb 已经按帧检测并攒好了退役的行，这里只管画。
+        // 退役的行已经攒好，这里只管画。
         let retired = std::mem::take(&mut self.pending);
         for line in &retired {
             self.archive(line.clone());
@@ -1660,6 +1681,85 @@ mod render_tests {
             assert!(joined.contains(m), "{m} missing from archive: {joined}");
         }
         assert_in_sync(&s, "alt screen scrolled");
+    }
+
+    /// ConPTY's actual shape: no clear, just walk the cursor and overwrite each
+    /// row. A half-delivered frame therefore leaves new rows above stale ones,
+    /// not blank space — which is what detection has to survive.
+    fn overwrite_rows(rows: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, text) in rows.iter().enumerate() {
+            out.extend(csi(&format!("{};1H", i + 1)));
+            out.extend(csi("2K"));
+            out.extend_from_slice(text.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn a_conpty_repaint_retires_the_same_lines_at_every_split_point() {
+        // absorb runs per network read, so detection sees whatever half of a
+        // frame happened to arrive. The retired count must not depend on where
+        // the reads fall — if it does, lines that never left get scrolled into
+        // the terminal and then drawn back, and the same block lands in the
+        // scrollback twice.
+        let old: Vec<String> = (0..10).map(|i| format!("chat{i}")).collect();
+        let new: Vec<String> = (3..13).map(|i| format!("chat{i}")).collect();
+        let old_refs: Vec<&str> = old.iter().map(|x| x.as_str()).collect();
+        let new_refs: Vec<&str> = new.iter().map(|x| x.as_str()).collect();
+        let bytes = overwrite_rows(&new_refs);
+
+        for cut in 0..=bytes.len() {
+            let mut s = screen();
+            s.feed(&enter_alt());
+            s.feed(&overwrite_rows(&old_refs));
+            let before = s.history_len();
+
+            s.absorb(&bytes[..cut]);
+            s.absorb(&bytes[cut..]);
+            s.flush();
+
+            assert_eq!(
+                s.history_len(),
+                before + 3,
+                "split at byte {cut} retired {} lines instead of 3",
+                s.history_len() - before
+            );
+        }
+    }
+
+    #[test]
+    fn a_repaint_split_across_chunks_retires_the_same_lines_as_a_whole_one() {
+        // The network hands a repaint over in pieces, and absorb runs on every
+        // piece. Detection therefore gets to compare a half-drawn screen against
+        // a whole one — and a half-drawn screen can still anchor somewhere,
+        // which retires lines that never left. They get scrolled into the
+        // terminal and then drawn back on screen, so the same block ends up
+        // twice in the scrollback.
+        let mut s = screen();
+        s.feed(&enter_alt());
+        let first: Vec<String> = (0..10).map(|i| format!("chat{i}")).collect();
+        let refs: Vec<&str> = first.iter().map(|x| x.as_str()).collect();
+        s.feed(&repaint_rows(&refs));
+        let before = s.history_len();
+
+        let second: Vec<String> = (3..13).map(|i| format!("chat{i}")).collect();
+        let refs: Vec<&str> = second.iter().map(|x| x.as_str()).collect();
+        let bytes = repaint_rows(&refs);
+
+        // Same repaint as the whole-chunk test above, only delivered in two
+        // reads. The answer must not depend on where the split lands.
+        let cut = bytes.len() / 2;
+        s.absorb(&bytes[..cut]);
+        s.absorb(&bytes[cut..]);
+        s.flush();
+
+        assert_eq!(
+            s.history_len(),
+            before + 3,
+            "split repaint retired a different number of lines than the whole one"
+        );
+        assert_in_sync(&s, "split repaint");
     }
 
     #[test]
