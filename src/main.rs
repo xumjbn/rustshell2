@@ -732,11 +732,17 @@ impl Screen {
         false
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
+    /// 返回 true 表示需要请远端重画一次。
+    fn resize(&mut self, rows: u16, cols: u16) -> bool {
         if self.passthrough {
             self.rows = rows;
             self.cols = cols;
-            return;
+            // 直通模式没有模型可以重画，只能把本地清成已知状态再让远端自己
+            // 重来。终端刚按自己的规则回流过一遍，留在屏幕上的是错位的旧内容，
+            // 不清掉的话远端没覆盖到的地方会一直花着。用 2J 而不是 3J——
+            // 滚动缓冲是直通模式下唯一的历史，不能连它一起清了。
+            write_stdout(b"\x1b[H\x1b[2J");
+            return true;
         }
         self.model.set_size(rows, cols);
         self.host.set_size(rows, cols);
@@ -744,6 +750,16 @@ impl Screen {
         self.cols = cols;
         self.prev_plain = self.model.screen().rows(0, cols).collect();
         self.prev_formatted = self.model.screen().rows_formatted(0, cols).collect();
+        // 尺寸变了必须整屏重画，不能接着 diff。
+        //
+        // 真实终端在被拉伸时会按自己的规则回流——换行的长行是重排还是截断、
+        // 光标下方的内容留不留——`vt100::set_size` 复现不出同一套结果。于是
+        // host 模型和终端实际显示分叉，而 diff 是对着 host 算的，之后每一帧
+        // 都画在错位的基准上，屏幕就花了。理由和备用屏幕切换那里一样：跨不
+        // 过去的状态变更，就别 diff。
+        self.repaint(false);
+        // 本地已经按模型画好了，不必劳烦远端。
+        false
     }
 
     fn active(&self) -> bool {
@@ -1535,10 +1551,45 @@ mod render_tests {
     fn resize_keeps_both_models_together() {
         let mut s = screen();
         s.feed(&line("before resize"));
-        s.resize(20, 60);
+        assert!(!s.resize(20, 60), "the renderer repaints locally");
         s.feed(&line("after resize"));
         assert_in_sync(&s, "resized");
         assert_eq!(s.model.screen().size(), (20, 60));
+    }
+
+    #[test]
+    fn resize_repaints_instead_of_trusting_the_host_model() {
+        // A real terminal reflows on resize by its own rules, which vt100's
+        // set_size does not reproduce, so after a resize the host model no
+        // longer describes what is on screen. Simulate that divergence and
+        // check the resize repaints rather than diffing against a stale
+        // baseline — otherwise every later frame is drawn at the wrong offset
+        // and the display turns to noise.
+        let mut s = screen();
+        s.feed(&line("before resize"));
+
+        // Whatever the terminal actually did with the old contents, it is not
+        // what our host model thinks.
+        s.host.process(b"\x1b[H\x1b[2Jreflowed differently by the terminal");
+        assert_ne!(
+            s.model.screen().contents(),
+            s.host.screen().contents(),
+            "test setup should have diverged the models"
+        );
+
+        s.resize(20, 60);
+        assert_in_sync(&s, "resize must resync the host model");
+    }
+
+    #[test]
+    fn passthrough_resize_asks_the_remote_to_redraw() {
+        // With no screen model there is nothing to repaint from, so the only way
+        // to clear the terminal's own reflow mess is to have the remote draw the
+        // screen again.
+        let mut s = screen();
+        s.passthrough = true;
+        assert!(s.resize(20, 60), "passthrough must request a remote redraw");
+        assert_eq!((s.rows, s.cols), (20, 60));
     }
     /// Enter the alternate screen, the way a full-screen app does.
     fn enter_alt() -> Vec<u8> {
@@ -2168,11 +2219,23 @@ async fn terminal_io_loop(
                 if let Ok((nc, nr)) = crossterm::terminal::size() {
                     if (nc != last_cols || nr != last_rows) && terminal_opened {
                         log::debug!("Resize: {}x{}", nc, nr);
-                        screen.resize(nr, nc);
+                        let ask_redraw = screen.resize(nr, nc);
                         let mut a = TerminalAction::new();
                         a.set_resize(ResizeTerminal { terminal_id, rows: nr as u32, cols: nc as u32, ..Default::default() });
                         let mut m = Message::new(); m.set_terminal_action(a);
                         conn.send(&m).await.ok();
+                        if ask_redraw {
+                            // 先让远端知道新尺寸，再请它按新尺寸重画。
+                            let mut a = TerminalAction::new();
+                            a.set_data(TerminalData {
+                                terminal_id,
+                                data: vec![0x0c].into(),
+                                compressed: false,
+                                ..Default::default()
+                            });
+                            let mut m = Message::new(); m.set_terminal_action(a);
+                            conn.send(&m).await.ok();
+                        }
                         last_cols = nc; last_rows = nr;
                     }
                 }
