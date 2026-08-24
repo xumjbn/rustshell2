@@ -10,8 +10,9 @@ use futures_util::{SinkExt, StreamExt};
 use protobuf::Message as ProtoMessage;
 use sodiumoxide::crypto::secretbox::Key;
 use std::io;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
 /// 建连与单次收发的超时。
 pub const CONNECT_TIMEOUT: u64 = 18_000;
@@ -154,6 +155,112 @@ impl Link {
         }
         frame
     }
+
+    /// 拆成互不相干的收、发两半。
+    ///
+    /// 握手是严格的一问一答，用整条 `Link` 就够；进入终端会话之后不行。那时
+    /// 两个方向是独立的：远端在不停地写，我们也要能随时发按键。只要收发共用
+    /// 一个 `&mut`，一次写阻塞就会连带让读停下——而对端正好在等我们读，于是
+    /// 两边各等各的，谁也不动。拆开之后读永远在跑，写再怎么堵也堵不住它，那
+    /// 个环就成立不了。
+    ///
+    /// 必须用 `TcpStream::into_split` 而不是 `StreamExt::split`：后者两半共享
+    /// 一把 `BiLock`，写在 flush 期间持锁，读照样被挡在外面，等于没拆。
+    pub fn split(self) -> (LinkReader, LinkWriter) {
+        use tokio_util::codec::Decoder;
+
+        let cipher = self.cipher;
+        let mut parts = self.framed.into_parts();
+
+        // 先，把已经读进来但还没解出去的字节里的完整帧全部取出来。
+        //
+        // 这一步不能省。`FramedRead` 只有在**从 socket 又读到东西之后**才会去
+        // 解自己的缓冲；直接把这段字节塞进它的缓冲，它会先去 socket 上等。而
+        // 此刻对端很可能正等着我们先把这些处理完才继续发——于是双方对等，一
+        // 个字节也不会再动。登录响应和它后面的终端数据经常落在同一次 TCP 读
+        // 里，所以这不是边角情况。
+        let mut ready: std::collections::VecDeque<Result<BytesMut, io::Error>> =
+            std::collections::VecDeque::new();
+        loop {
+            match parts.codec.decode(&mut parts.read_buf) {
+                Ok(Some(frame)) => ready.push_back(Ok(frame)),
+                Ok(None) => break,
+                // 坏帧照样排进队列，让它在轮到自己的位置上报出来，而不是在这里
+                // 被吞掉。
+                Err(e) => {
+                    ready.push_back(Err(e));
+                    break;
+                }
+            }
+        }
+
+        let (rx, tx) = parts.io.into_split();
+        // codec 必须搬过去而不是新建一个：`FrameCodec` 记着自己是在等长度头
+        // 还是在等某个已知长度的载荷，丢了这个状态，下一帧就从半截开始解。
+        let mut read = FramedRead::new(rx, parts.codec);
+        // 上面取剩下的是半截帧。它本来就要等 socket 再给点字节才能凑齐，所以
+        // 放进 FramedRead 的缓冲里正合适。
+        if !parts.read_buf.is_empty() {
+            read.read_buffer_mut().unsplit(parts.read_buf);
+        }
+        // 编码器是无状态的，新建一个即可；待发字节仍要搬。
+        let mut write = FramedWrite::new(tx, FrameCodec::new());
+        if !parts.write_buf.is_empty() {
+            write.write_buffer_mut().unsplit(parts.write_buf);
+        }
+
+        (
+            LinkReader { framed: read, ready, cipher: cipher.clone() },
+            LinkWriter { framed: write, cipher },
+        )
+    }
+}
+
+/// `Link` 的收半边。
+pub struct LinkReader {
+    framed: FramedRead<OwnedReadHalf, FrameCodec>,
+    /// split 那一刻就已经在缓冲里、解得出来的帧，先于 socket 上的新帧交付。
+    ready: std::collections::VecDeque<Result<BytesMut, io::Error>>,
+    cipher: Option<Cipher>,
+}
+
+impl LinkReader {
+    /// 收一帧，语义与 `Link::next` 完全一致。
+    pub async fn next(&mut self) -> Option<Result<BytesMut, io::Error>> {
+        // 顺序不能乱：解密的序号是按到达顺序推进的，插一帧或错一帧，之后每一
+        // 条都解不开。
+        let mut frame = match self.ready.pop_front() {
+            Some(frame) => Some(frame),
+            None => self.framed.next().await,
+        };
+        if let (Some(Ok(bytes)), Some(cipher)) = (frame.as_mut(), self.cipher.as_mut()) {
+            if let Err(e) = cipher.open(bytes) {
+                return Some(Err(e));
+            }
+        }
+        frame
+    }
+}
+
+/// `Link` 的发半边。
+pub struct LinkWriter {
+    framed: FramedWrite<OwnedWriteHalf, FrameCodec>,
+    cipher: Option<Cipher>,
+}
+
+impl LinkWriter {
+    /// 发一条 protobuf 消息，语义与 `Link::send` 完全一致。
+    ///
+    /// 序号由调用顺序决定，所以这一半必须由单独一个任务独占；多处并发调用会
+    /// 让封包顺序和上线顺序对不上，对端从此一条也解不开。
+    pub async fn send(&mut self, msg: &impl ProtoMessage) -> Result<()> {
+        let mut bytes = msg.write_to_bytes()?;
+        if let Some(cipher) = self.cipher.as_mut() {
+            bytes = cipher.seal(&bytes);
+        }
+        self.framed.send(Bytes::from(bytes)).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +330,107 @@ mod tests {
         assert!(decode_peer_addr(&[]).is_none());
         // A length that cannot be either form is refused rather than guessed at.
         assert!(decode_peer_addr(&[0u8; 17]).is_none());
+    }
+
+    /// 建一对真的 TCP 连接。`Link` 只认 `TcpStream`,拿 duplex 之类的内存管道
+    /// 替代不了——`split` 要做的正是 `TcpStream::into_split`。
+    async fn connected_pair() -> (Link, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = Link::connect(&addr.to_string(), 5_000).await.unwrap();
+        (client, accept.await.unwrap())
+    }
+
+    /// 按线格式打一个帧头。
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        use bytes::BufMut;
+        let mut buf = bytes::BytesMut::new();
+        let n = payload.len();
+        assert!(n < 0x40, "这个测试只用小帧");
+        buf.put_u8((n << 2) as u8);
+        buf.put_slice(payload);
+        buf.to_vec()
+    }
+
+    #[tokio::test]
+    async fn split_keeps_bytes_that_were_already_read() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut link, mut peer) = connected_pair().await;
+
+        // 三帧一次写出去,极可能落在同一次 TCP 读里。
+        let mut wire = frame(b"one");
+        wire.extend(frame(b"two"));
+        wire.extend(frame(b"three"));
+        peer.write_all(&wire).await.unwrap();
+        peer.flush().await.unwrap();
+
+        // 只取第一帧。剩下两帧此时已经躺在 Framed 的读缓冲里了——真实场景就是
+        // 登录响应和它后面的终端数据挤在同一次读里。
+        let first = link.next().await.unwrap().unwrap();
+        assert_eq!(&first[..], b"one");
+
+        // 拆开。读缓冲不搬过去的话，后面两帧就凭空消失。
+        let (mut reader, _writer) = link.split();
+        let second = reader.next().await.unwrap().unwrap();
+        assert_eq!(&second[..], b"two", "缓冲里的帧在 split 时丢了");
+        let third = reader.next().await.unwrap().unwrap();
+        assert_eq!(&third[..], b"three");
+    }
+
+    #[tokio::test]
+    async fn split_keeps_a_half_arrived_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut link, mut peer) = connected_pair().await;
+
+        // 一个帧头加半截载荷。解码器读掉了头、正等着剩下的字节——split 时必须
+        // 把这个「还差多少」的状态一起搬走,否则下一帧会从半截开始解。
+        let whole = frame(b"payload");
+        peer.write_all(&whole[..4]).await.unwrap();
+        peer.flush().await.unwrap();
+
+        // 逼 Framed 真的去读一次，从而进入等载荷的状态。
+        let pending = timeout(150, link.next()).await;
+        assert!(pending.is_err(), "半截帧不该解出东西来");
+
+        let (mut reader, _writer) = link.split();
+        peer.write_all(&whole[4..]).await.unwrap();
+        peer.flush().await.unwrap();
+        let frame = timeout(2_000, reader.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(&frame[..], b"payload", "跨 split 边界的帧解错了");
+    }
+
+    #[tokio::test]
+    async fn the_two_halves_keep_their_own_sequence_numbers() {
+        use sodiumoxide::crypto::secretbox;
+
+        let (mut link, peer) = connected_pair().await;
+        let key = secretbox::gen_key();
+        link.set_key(key.clone());
+
+        // 对端的收方向:序号从 1 开始,与我们的发方向对齐。
+        let mut peer_link = Link { framed: Framed::new(peer, FrameCodec::new()), cipher: None };
+        peer_link.set_key(key);
+
+        let (_reader, mut writer) = link.split();
+        for id in 0..5 {
+            let mut msg = crate::proto::rustshell::CloseTerminal::new();
+            msg.terminal_id = id;
+            writer.send(&msg).await.unwrap();
+        }
+        // 序号错开一格,对端从此一条也解不开;顺序乱了则 id 对不上。两种都要挡住。
+        for id in 0..5 {
+            let got = peer_link
+                .next()
+                .await
+                .unwrap()
+                .expect("序号对不上就解不开了");
+            let parsed =
+                crate::proto::rustshell::CloseTerminal::parse_from_bytes(&got).unwrap();
+            assert_eq!(parsed.terminal_id, id, "拆开之后发方向的顺序乱了");
+        }
     }
 
     #[test]

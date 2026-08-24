@@ -112,6 +112,10 @@ impl Encoder<Bytes> for FrameCodec {
 }
 
 /// 会话密钥与两个方向的序号。
+///
+/// 可以 Clone，是为了把连接拆成独立的收发两半时一边给一份：两个方向的序号
+/// 本来就互不相干，各自那一半只会推进属于自己的那个计数。
+#[derive(Clone)]
 pub struct Cipher {
     key: Key,
     sent: u64,

@@ -5,7 +5,7 @@ mod wire;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use link::{
-    check_port, increase_port, timeout, Link, CONNECT_TIMEOUT, RELAY_PORT, RS_PUB_KEY,
+    check_port, increase_port, timeout, Link, LinkWriter, CONNECT_TIMEOUT, RELAY_PORT, RS_PUB_KEY,
 };
 use proto::rustshell::*;
 use protobuf::Message as ProtoMessage;
@@ -258,14 +258,28 @@ enum Input {
 /// has to stay whole rather than being replayed as keystrokes.
 fn poll_input() -> Option<Input> {
     use crossterm::event::{self, Event, KeyEventKind};
-    if !event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-        return None;
+    // 一轮最多处理这么多事件。返回 None 是调用方停止排空的信号,所以必须有个
+    // 上限保证一定回得去——否则事件源一直有货就再也回不到收发循环。
+    const MAX_SKIP: usize = 512;
+    for _ in 0..MAX_SKIP {
+        if !event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+            return None;
+        }
+        match event::read() {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => return Some(Input::Key(k)),
+            Ok(Event::Paste(s)) => return Some(Input::Paste(s)),
+            // 不关心的事件要跳过去接着取,不能当成「没有输入了」。
+            //
+            // 调用方是 `while let Some(_) = poll_input()`,在这里返回 None 会
+            // 让整轮排空提前结束。而 Windows 上每次按键都跟着一个 Release 事
+            // 件,再加上 Resize、焦点变化,几乎每一轮都会被截断——输入于是被
+            // 限速到每个 20ms tick 一个事件,多出来的堆在控制台队列里越积越
+            // 多,表现就是「敲不进去」。
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
     }
-    match event::read() {
-        Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => Some(Input::Key(k)),
-        Ok(Event::Paste(s)) => Some(Input::Paste(s)),
-        _ => None,
-    }
+    None
 }
 
 // ── Scrollback viewer ──────────────────────────────────────────────
@@ -457,6 +471,11 @@ struct Screen {
     passthrough: bool,
     /// vt100 history length as of the last absorb.
     drawn_history: usize,
+    /// 上一次 absorb 看到的备用屏幕状态。
+    ///
+    /// 与 `alt` 分开：那个由 flush/repaint 维护，按帧走；这个要按分片走，因为
+    /// 判断历史长度的跳变是不是「换了块画布」必须在同一次 absorb 里完成。
+    absorb_alt: bool,
     /// 自上次渲染以来退役的行，等着被推进宿主终端的滚动缓冲。
     pending: Vec<Vec<u8>>,
     /// 本帧内 vt100 自己增长出来的历史行数。
@@ -482,6 +501,7 @@ impl Screen {
             status: None,
             passthrough: true,
             drawn_history: 0,
+            absorb_alt: false,
             pending: Vec::new(),
             natural_in_frame: 0,
         }
@@ -498,6 +518,18 @@ impl Screen {
         }
         write_stdout(bytes);
         self.host.process(bytes);
+    }
+
+    /// 把字节攒进本帧的输出缓冲，并让 host 模型立刻跟上。
+    ///
+    /// 与 `emit` 的区别只在于不马上写出去。host 必须在这里就更新,因为同一帧
+    /// 里后面算 diff 要拿它当基准——基准慢一步,diff 就画错位置。
+    fn stage(&mut self, frame: &mut Vec<u8>, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.host.process(bytes);
+        frame.extend_from_slice(bytes);
     }
 
     /// Park a message on the last row for a few seconds.
@@ -591,8 +623,41 @@ impl Screen {
             write_stdout(data);
             return;
         }
+        // 切成不超过一屏字节数的小片喂进去。
+        //
+        // vt100 只能透过「一屏那么大的窗口」回看历史:它把可见行拼成
+        // `scrollback[len-off..] ++ rows[..rows-off]`,off 一旦超过屏幕行数,
+        // 后半段的减法就下溢——debug 构建当场 panic,release 构建靠回绕侥幸
+        // 得出对的结果。而一次 process 能一口气把几百行顶出屏幕,off 就是这么
+        // 超出去的:远端一帧里塞进比一屏还多的行,正是刷屏的全屏应用的常态。
+        //
+        // 一个字节最多让行号前进一格,所以每片给不超过 rows 个字节,就保证每
+        // 片新增的历史行数不超过一屏,取历史行时的 off 永远落在 vt100 撑得住
+        // 的范围内。vt100 是流式解析器,从任意字节处切开都不影响解析结果。
+        let step = (self.rows as usize).max(1);
+        for chunk in data.chunks(step) {
+            self.absorb_chunk(chunk);
+        }
+        // 启发式检测不在这里做——见 detect_retired。
+    }
+
+    /// 吸收一片保证不会顶出超过一屏内容的字节。
+    fn absorb_chunk(&mut self, data: &[u8]) {
         let before = self.drawn_history;
         self.model.process(data);
+
+        // 备用屏幕是另一块不带回滚的画布,进出它会把历史长度整个换掉:进去时
+        // 归零,出来时主屏那份又整体回来。把这个跳变当成「新增了这么多历史」
+        // 的话,离开备用屏幕的一瞬间会把整份主屏历史(上限一万行)重新归档一
+        // 遍,再由 flush 逐行写进终端——冻屏好几秒,回滚里还平白多出一整份重
+        // 复。全屏应用退出时必然撞上。它不是滚动,重新对一次基准即可。
+        let alt = self.model.screen().alternate_screen();
+        if alt != self.absorb_alt {
+            self.absorb_alt = alt;
+            self.drawn_history = self.vt_history();
+            return;
+        }
+
         let after = self.vt_history();
         self.drawn_history = after;
 
@@ -611,7 +676,6 @@ impl Screen {
                 self.history.len()
             );
         }
-        // 启发式检测不在这里做——见 detect_retired。
     }
 
     /// 整帧落地之后再判断有没有发生「重绘式滚动」。
@@ -689,7 +753,10 @@ impl Screen {
             return;
         }
 
-        let mut out: Vec<u8> = Vec::with_capacity(4096);
+        // 一帧只写一次。原先退役滚动、diff、状态行各写一次、各 flush 一次,
+        // 三趟系统调用;Windows 控制台上这个往返不便宜,而且中间态会闪。
+        let mut frame: Vec<u8> = Vec::with_capacity(4096);
+        let mut out: Vec<u8> = Vec::with_capacity(1024);
         if !retired.is_empty() {
             // 在最后一行换行是唯一能让终端滚动的办法，而滚动是行进入它自己
             // 滚动缓冲的唯一途径。还在屏幕上的行会带着自己的格式一起上去，
@@ -707,15 +774,20 @@ impl Screen {
                 }
             }
         }
-        self.emit(&out);
+        self.stage(&mut frame, &out);
 
         let diff = self.model.screen().contents_diff(self.host.screen());
-        self.emit(&diff);
+        self.stage(&mut frame, &diff);
 
         // 状态行每帧重画，因为远端应用一直在覆盖最后一行。
-        if let Some(line) = self.status_line() {
-            self.emit(&line);
-        } else if self.status.is_some() {
+        let status = self.status_line();
+        if let Some(line) = &status {
+            self.stage(&mut frame, line);
+        }
+        write_stdout(&frame);
+
+        // 状态行刚过期：屏幕上还留着它，只能整屏重画抹掉。
+        if status.is_none() && self.status.is_some() {
             self.status = None;
             self.repaint(false);
         }
@@ -767,6 +839,9 @@ impl Screen {
         }
         self.model.set_size(rows, cols);
         self.host.set_size(rows, cols);
+        // 改尺寸会让 vt100 重排网格，历史长度跟着跳。那个跳变不是滚动,拿旧
+        // 基准去减会凭空归档一大批行,和进出备用屏幕是同一类问题。
+        self.drawn_history = self.vt_history();
         self.rows = rows;
         self.cols = cols;
         self.prev_plain = self.model.screen().rows(0, cols).collect();
@@ -1249,7 +1324,7 @@ async fn run(
     }
 
     // Phase 6: Terminal I/O
-    terminal_io_loop(&mut conn, &remote_platform, quit_key, render, new_session, slot, log_path, detach).await
+    terminal_io_loop(conn, &remote_platform, quit_key, render, new_session, slot, log_path, detach).await
 }
 
 // ── secure_tcp ─────────────────────────────────────────────────────
@@ -1464,6 +1539,9 @@ mod render_tests {
         // The case a naive implementation gets wrong: one frame retires more
         // lines than the screen ever held, so most never reached the terminal
         // and cannot simply be scrolled into its scrollback.
+        //
+        // 也是 absorb 分片喂的理由:vt100 只能透过一屏那么大的窗口回看历史,一
+        // 口气顶出去 91 行再去取,它自己的减法就下溢——debug 构建当场 panic。
         let mut s = screen();
         let mut burst = Vec::new();
         for i in 0..100 {
@@ -1925,6 +2003,13 @@ mod render_tests {
         assert_in_sync(&s, "left");
         // Nothing archived may be lost by crossing back.
         assert!(s.history_len() >= during_alt, "archive shrank on leaving the alternate screen");
+        // 也不能凭空多出来。见下面那条专门的测试。
+        assert!(
+            s.history_len() <= during_alt + s.rows as usize,
+            "leaving the alternate screen re-archived history: {} -> {}",
+            during_alt,
+            s.history_len()
+        );
         // And the shell is back.
         assert!(s.model.screen().contents().contains("shell19"));
 
@@ -1937,6 +2022,34 @@ mod render_tests {
             .join("|");
         assert!(archived.contains("shell0"), "shell history lost");
         assert!(archived.contains("app0"), "app history lost");
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_does_not_re_archive_the_main_one() {
+        // 备用屏幕是另一块不带回滚的画布:进去时 vt100 的历史长度归零,出来时
+        // 主屏那份整体回来。把这个跳变当成「新增了这么多历史」的话,全屏应用
+        // 一退出就会把整份主屏历史(上限一万行)重新归档一遍,再由 flush 逐行
+        // 写进终端——冻屏好几秒,回滚里还平白多出一整份重复。
+        //
+        // codex、vim 这类应用全程待在备用屏幕里,退出时必然撞上这一下。
+        let mut s = screen();
+        for i in 0..60 {
+            s.feed(&line(&format!("shell{i}")));
+        }
+        let main_history = s.history_len();
+        assert!(main_history >= 40, "主屏历史太少，测不出问题: {main_history}");
+
+        s.feed(&enter_alt());
+        s.feed(&repaint_rows(&["app row"]));
+        let before_leave = s.history_len();
+
+        s.feed(&leave_alt());
+        assert_eq!(
+            s.history_len(),
+            before_leave,
+            "离开备用屏幕把整份主屏历史又归档了一遍"
+        );
+        assert_in_sync(&s, "left the alternate screen");
     }
 
     #[test]
@@ -2118,8 +2231,80 @@ fn claim_lock(path: &std::path::Path) -> bool {
 
 // ── Terminal I/O loop ──────────────────────────────────────────────
 
+/// 待发消息队列的长度。
+///
+/// 出站流量是按键、改尺寸和保活,都是几十字节的小消息。攒到这个数还没写出去,
+/// 只可能是链路已经不动了,而不是一时拥塞。
+const OUTBOUND_QUEUE: usize = 256;
+
+/// 单次发送慢过这个数就记一笔,用来事后判断是哪一端在堵。
+const SLOW_SEND: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 一帧画得慢过这个数就记一笔——本地渲染或控制台成了瓶颈的信号。
+const SLOW_FLUSH: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 这么久没收到帧就记一笔。远端或链路不动了的信号。
+const QUIET_WARN: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 一条消息允许花多久写上线。
+///
+/// 按键之类的小消息给固定预算就够;剪贴板图片能有好几 MB,慢一点的中继上本来
+/// 就要几十秒,拿同一把尺子量会把好好的连接判死。所以按大小追加预算,底线约
+/// 64 KB/s。
+fn send_budget(msg: &Message) -> u64 {
+    let bytes = msg.compute_size();
+    CONNECT_TIMEOUT + bytes / 64
+}
+
+/// 独占发半边的写任务。
+///
+/// 存在的理由是它必须和读**分开跑**。收发共用一个 `&mut Link` 时,一次写阻塞
+/// 会连带把读也停掉;而对端阻塞在写上、正等着我们读,于是两边各等各的,谁也不
+/// 动。原先循环里 12 处发送一个超时都没有,连「发不出去就判定掉线重连」的保活
+/// 自己都卡在同一个环上,所以这个死锁一旦成立就是永久的:没有输出、没有回显、
+/// 也不会重连——正是「跑一阵子整个窗口全死」的样子。
+///
+/// 拆开之后读永远在跑,远端的写能排空、随即恢复读,堵住的这一边自己就通了。
+async fn writer_loop(mut writer: LinkWriter, mut rx: tokio::sync::mpsc::Receiver<Message>) {
+    while let Some(msg) = rx.recv().await {
+        let started = std::time::Instant::now();
+        match timeout(send_budget(&msg), writer.send(&msg)).await {
+            Ok(Ok(())) => {
+                if started.elapsed() >= SLOW_SEND {
+                    log::debug!("writer: send took {:?}", started.elapsed());
+                }
+            }
+            Ok(Err(e)) => {
+                log::info!("Send failed ({e}), connection lost");
+                return;
+            }
+            // 超时的 send 是在 flush 中途被丢掉的,写缓冲里可能留着半条帧。所以
+            // 只能结束——这一半连同整条连接随即被丢弃重连,不存在带着脏缓冲接
+            // 着用的情况。
+            Err(_) => {
+                log::info!("Send timed out, link is wedged");
+                return;
+            }
+        }
+    }
+}
+
+/// 等写任务把队列里剩下的消息真正冲上线。
+///
+/// 退出路径必须走这一步。不等的话,函数一返回、写半边随即关掉,排在队列里的
+/// `CloseTerminal` 就没了——远端会留下一具「shell 已死、服务端仍登记着」的空
+/// 壳会话,下次不带 -n 重连正好接回它,拿到的是上次退出前那一屏,之后再无输出,
+/// 看起来就是卡死在上次 exit 的地方。
+async fn drain_writer(tx: tokio::sync::mpsc::Sender<Message>, task: tokio::task::JoinHandle<()>) {
+    // 关掉发送端，写任务收完队列里剩下的就会自己结束。
+    drop(tx);
+    if timeout(3_000, task).await.is_err() {
+        log::debug!("writer did not drain in time");
+    }
+}
+
 async fn terminal_io_loop(
-    conn: &mut Link, remote_platform: &str, quit_key: char, render: bool, new_session: bool,
+    mut conn: Link, remote_platform: &str, quit_key: char, render: bool, new_session: bool,
     slot: &TerminalSlot, log_path: Option<std::path::PathBuf>, detach: bool,
 ) -> Result<SessionEnd> {
     let mut session_log = match log_path {
@@ -2141,9 +2326,14 @@ async fn terminal_io_loop(
         action.set_open(OpenTerminal { terminal_id, rows: rows as u32, cols: cols as u32, ..Default::default() });
         let mut msg = Message::new();
         msg.set_terminal_action(action);
-        send_msg(conn, &msg, "open_terminal").await?;
+        send_msg(&mut conn, &msg, "open_terminal").await?;
     }
     log::debug!("OpenTerminal sent ({}x{}), waiting for shell...", cols, rows);
+
+    // 握手是一问一答，整条 Link 用着正好；从这里开始两个方向各走各的。
+    let (mut reader, writer) = conn.split();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Message>(OUTBOUND_QUEUE);
+    let writer_task = tokio::spawn(writer_loop(writer, rx));
 
     let mut screen = Screen::new(rows, cols);
     screen.passthrough = !render;
@@ -2156,12 +2346,29 @@ async fn terminal_io_loop(
     // 第一批未画出数据的时刻，以及最近一批的时刻。
     let mut pending_since: Option<std::time::Instant> = None;
     let mut last_data = std::time::Instant::now();
+    // 一段静默只提醒一次，否则日志会被刷屏。
+    let mut quiet_logged = false;
     // 静默这么久就认为一次重绘的分片已经到齐了。
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(12);
     // 但输出不停的时候永远等不到静默，所以再给一个强制上限，否则屏幕会冻住。
     const MAX_HOLD: std::time::Duration = std::time::Duration::from_millis(60);
     let mut last_cols = cols;
     let mut last_rows = rows;
+
+    /// 把消息交给写任务。
+    ///
+    /// 关键在于它**不等**:排进队列就返回,于是发送再也不会挡住这一轮 select,
+    /// `reader.next()` 始终有机会被 poll,读永不停。队列满说明写任务已经很久没
+    /// 动过了,队列关了说明它已经死了——两种都是链路废了,判掉线让 main 重连,
+    /// 而不是像原先那样永远挂在一次 send 上。
+    macro_rules! send_out {
+        ($msg:expr) => {
+            if let Err(e) = tx.try_send($msg) {
+                log::info!("Outbound send dropped ({e}), connection lost");
+                return Ok(SessionEnd::Disconnected);
+            }
+        };
+    }
 
     loop {
         tokio::select! {
@@ -2171,16 +2378,13 @@ async fn terminal_io_loop(
                     // made sessions die on their own. Keep the link warm and
                     // treat a failed send as the link being gone, rather than
                     // silently ignoring it and waiting forever for data.
-                    if let Err(e) = conn.send(&Message::new()).await {
-                        log::info!("Keepalive failed ({}), connection lost", e);
-                        return Ok(SessionEnd::Disconnected);
-                    }
+                    send_out!(Message::new());
                     // Prove to other local instances that this slot is still ours.
                     slot.refresh();
                 }
             }
 
-            res = conn.next() => {
+            res = reader.next() => {
                 let bytes = match res {
                     Some(Ok(b)) => b,
                     // Both mean the transport died, not that the remote shell
@@ -2216,8 +2420,8 @@ async fn terminal_io_loop(
                                     match built {
                                         Ok((m, bytes, w, h)) => {
                                             log::info!("cliptest: sending {w}x{h}, {bytes} bytes on the wire");
-                                            match conn.send(&m).await {
-                                                Ok(()) => log::info!("cliptest: sent"),
+                                            match tx.try_send(m) {
+                                                Ok(()) => log::info!("cliptest: queued"),
                                                 Err(e) => log::error!("cliptest: send failed: {e}"),
                                             }
                                         }
@@ -2282,7 +2486,7 @@ async fn terminal_io_loop(
                                         });
                                         let mut m = Message::new();
                                         m.set_terminal_action(a);
-                                        conn.send(&m).await.ok();
+                                        send_out!(m);
                                     }
                                 } else {
                                     first_frame = false;
@@ -2291,6 +2495,7 @@ async fn terminal_io_loop(
                                     // 做滚动检测。
                                     screen.absorb(&output);
                                     last_data = std::time::Instant::now();
+                                    quiet_logged = false;
                                     pending_since.get_or_insert(last_data);
                                 }
                                 if let Some(l) = session_log.as_mut() { l.append(&output); }
@@ -2309,8 +2514,9 @@ async fn terminal_io_loop(
                                     a.set_close(CloseTerminal { terminal_id, ..Default::default() });
                                     let mut m = Message::new();
                                     m.set_terminal_action(a);
-                                    conn.send(&m).await.ok();
+                                    tx.try_send(m).ok();
                                 }
+                                drain_writer(tx, writer_task).await;
                                 return Ok(SessionEnd::RemoteClosed);
                             }
                             Some(Union::Error(e)) => bail!("Terminal error: {}", e.message),
@@ -2323,11 +2529,29 @@ async fn terminal_io_loop(
             }
 
             _ = input_timer.tick() => {
+                // 写任务死了就等于链路断了。靠下一次发送去发现的话，空闲时要
+                // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
+                if writer_task.is_finished() {
+                    log::info!("Writer task ended, connection lost");
+                    return Ok(SessionEnd::Disconnected);
+                }
+
                 if let Some(since) = pending_since {
                     if last_data.elapsed() >= SETTLE || since.elapsed() >= MAX_HOLD {
+                        let started = std::time::Instant::now();
                         screen.flush();
+                        if started.elapsed() >= SLOW_FLUSH {
+                            log::debug!("flush took {:?}", started.elapsed());
+                        }
                         pending_since = None;
                     }
+                }
+
+                // 卡死时日志的最后一行要能指认是哪一环:收不到帧了(远端或链路
+                // 堵了),还是收得到但画不出来(本地慢了)。
+                if terminal_opened && last_data.elapsed() >= QUIET_WARN && !quiet_logged {
+                    quiet_logged = true;
+                    log::debug!("no frame received for {:?}", last_data.elapsed());
                 }
 
                 if let Ok((nc, nr)) = crossterm::terminal::size() {
@@ -2337,7 +2561,7 @@ async fn terminal_io_loop(
                         let mut a = TerminalAction::new();
                         a.set_resize(ResizeTerminal { terminal_id, rows: nr as u32, cols: nc as u32, ..Default::default() });
                         let mut m = Message::new(); m.set_terminal_action(a);
-                        conn.send(&m).await.ok();
+                        send_out!(m);
                         if ask_redraw {
                             // 先让远端知道新尺寸，再请它按新尺寸重画。
                             let mut a = TerminalAction::new();
@@ -2348,7 +2572,7 @@ async fn terminal_io_loop(
                                 ..Default::default()
                             });
                             let mut m = Message::new(); m.set_terminal_action(a);
-                            conn.send(&m).await.ok();
+                            send_out!(m);
                         }
                         last_cols = nc; last_rows = nr;
                     }
@@ -2374,7 +2598,7 @@ async fn terminal_io_loop(
                             let mut a = TerminalAction::new();
                             a.set_data(TerminalData { terminal_id, data: payload.into(), compressed: false, ..Default::default() });
                             let mut m = Message::new(); m.set_terminal_action(a);
-                            conn.send(&m).await.ok();
+                            send_out!(m);
                             continue;
                         }
                     };
@@ -2425,7 +2649,8 @@ async fn terminal_io_loop(
                         match built {
                             Ok((m, bytes, w, h)) => {
                                 log::debug!("clipboard image {w}x{h}, {bytes} bytes compressed");
-                                if let Err(e) = conn.send(&m).await {
+                                // 剪贴板发不出去不值得断开会话，只报一声。
+                                if let Err(e) = tx.try_send(m) {
                                     screen.set_status(format!("clipboard: send failed: {e}"));
                                 } else {
                                     screen.set_status(format!(
@@ -2467,7 +2692,7 @@ async fn terminal_io_loop(
                             });
                             let mut m = Message::new();
                             m.set_terminal_action(a);
-                            conn.send(&m).await.ok();
+                            tx.try_send(m).ok();
                         }
                         if detach {
                             log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
@@ -2477,9 +2702,10 @@ async fn terminal_io_loop(
                                 let mut a = TerminalAction::new();
                                 a.set_close(CloseTerminal { terminal_id, ..Default::default() });
                                 let mut m = Message::new(); m.set_terminal_action(a);
-                                conn.send(&m).await.ok();
+                                tx.try_send(m).ok();
                             }
                         }
+                        drain_writer(tx, writer_task).await;
                         return Ok(SessionEnd::UserQuit);
                     }
                     // 攒起来，本轮结束一次发完。一个按键一条消息的话，打字
@@ -2498,7 +2724,7 @@ async fn terminal_io_loop(
                     });
                     let mut m = Message::new();
                     m.set_terminal_action(a);
-                    conn.send(&m).await.ok();
+                    send_out!(m);
                 }
             }
         }
