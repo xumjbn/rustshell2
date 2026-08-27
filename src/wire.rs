@@ -33,7 +33,9 @@ pub struct FrameCodec {
 
 impl FrameCodec {
     pub fn new() -> Self {
-        Self { state: DecodeState::Head }
+        Self {
+            state: DecodeState::Head,
+        }
     }
 
     /// 长度头，如果还没收满就返回 None。
@@ -52,7 +54,10 @@ impl FrameCodec {
         }
         n >>= 2;
         if n > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         src.advance(head_len);
         src.reserve(n);
@@ -90,7 +95,10 @@ impl Encoder<Bytes> for FrameCodec {
     fn encode(&mut self, data: Bytes, buf: &mut BytesMut) -> Result<(), io::Error> {
         let n = data.len();
         if n > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         // 头部宽度由长度决定，低 2 位写进宽度标记。三字节那档没有对应的整数
         // 类型，所以拆成 u16 + u8 两次写。
@@ -124,7 +132,11 @@ pub struct Cipher {
 
 impl Cipher {
     pub fn new(key: Key) -> Self {
-        Self { key, sent: 0, received: 0 }
+        Self {
+            key,
+            sent: 0,
+            received: 0,
+        }
     }
 
     /// nonce 的前 8 字节是小端序号，其余为零。
@@ -203,15 +215,23 @@ mod tests {
     fn a_frame_split_across_reads_is_reassembled() {
         let mut codec = FrameCodec::new();
         let mut buf = BytesMut::new();
-        codec.encode(Bytes::from(vec![7u8; 5000]), &mut buf).unwrap();
+        codec
+            .encode(Bytes::from(vec![7u8; 5000]), &mut buf)
+            .unwrap();
 
         // Feed it in three pieces, including a split inside the header.
         let whole = buf.split().freeze();
         let mut incoming = BytesMut::new();
         incoming.put_slice(&whole[..1]);
-        assert!(codec.decode(&mut incoming).unwrap().is_none(), "header incomplete");
+        assert!(
+            codec.decode(&mut incoming).unwrap().is_none(),
+            "header incomplete"
+        );
         incoming.put_slice(&whole[1..100]);
-        assert!(codec.decode(&mut incoming).unwrap().is_none(), "body incomplete");
+        assert!(
+            codec.decode(&mut incoming).unwrap().is_none(),
+            "body incomplete"
+        );
         incoming.put_slice(&whole[100..]);
         let frame = codec.decode(&mut incoming).unwrap().expect("now complete");
         assert_eq!(frame.len(), 5000);
@@ -221,8 +241,12 @@ mod tests {
     fn back_to_back_frames_decode_one_at_a_time() {
         let mut codec = FrameCodec::new();
         let mut buf = BytesMut::new();
-        codec.encode(Bytes::from_static(b"first"), &mut buf).unwrap();
-        codec.encode(Bytes::from_static(b"second"), &mut buf).unwrap();
+        codec
+            .encode(Bytes::from_static(b"first"), &mut buf)
+            .unwrap();
+        codec
+            .encode(Bytes::from_static(b"second"), &mut buf)
+            .unwrap();
         assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"first");
         assert_eq!(&codec.decode(&mut buf).unwrap().unwrap()[..], b"second");
         assert!(codec.decode(&mut buf).unwrap().is_none());

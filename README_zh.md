@@ -42,13 +42,19 @@ rustshell [OPTIONS] --id <ID> --server <SERVER>
   -h, --help                 打印帮助
 ```
 
-### 持久会话
+### 会话生命周期
 
-客户端会请求远端保留会话（`terminal_persistent`），下次启动自动重连，远端随即回放
-缓冲的输出。按退出键会**关闭**远端 shell。也可以用 `--detach` 让它继续运行，但这在远端是有代价的：
-连接套接字会堆积在 `CLOSE_WAIT`，每个存活的 service 还各自跑一个轮询线程，会话攒多了
-就会占满一个核，最终把设备从 rendezvous 服务器上挤掉线。真正要紧的场景——意外断线——
-仍由重连覆盖，客户端会接回同一个会话。想要干净的新 shell 就加 `--new-session`。
+会话始终声明 `terminal_persistent`，异常断线后可以接回。这是在规避 RustDesk 1.4.6 的服务端
+缺陷：非持久连接断开时，它会持有全局终端注册表锁并同步销毁 Windows helper；helper 一旦卡住，
+后续所有 shell 都无法打开。正常按 Ctrl+Q 仍会发送 `CloseTerminal`，并最多等待两秒关闭确认。
+随后所有本地退出路径都会先发送 RustDesk 连接级的 `close_reason` 握手再释放中继 socket；缺少它时，
+1.4.6 Windows 服务端会残留 `CLOSE_WAIT`。`--detach` 只跳过 `CloseTerminal`、保留远端 shell，
+仍会正常关闭对等连接。
+
+`--new-session` 会直接使用全新的 service ID，不再先关闭旧 service。这是刻意绕开 RustDesk 1.4.6
+的缺陷：它可能永远阻塞在旧 Windows helper 的关闭过程中，导致后续 Open 根本得不到执行。
+在 macOS/Linux 上，关闭本地终端窗口产生的 `SIGHUP` 或 `SIGTERM` 仍会发送 `CloseTerminal`；
+只有显式使用 `--detach` 时才保留远端 shell。
 
 每个并发窗口占用一个**槽位**，一个槽位对应一个独立的远端会话。这一点很关键：远端会把
 某个会话的输出广播给所有连到它的客户端，所以两个窗口共用一个会话就会互相看到对方的输入。
@@ -235,12 +241,12 @@ Shift+F5 之所以存在：屏幕是根据「你的终端正在显示什么」�
 
 **Windows 远端输入 `exit` 后连接挂起：**
 - 这是 RustDesk 服务端的[已知 bug](https://github.com/rustdesk/rustdesk/blob/caadd72ab2db8cc66e3d237e3e1cb60edbab7bc5/src/server/terminal_service.rs#L1267-L1270)：Windows ConPTY 在子进程退出时不发送 EOF 信号，导致服务端无法检测到会话已结束
-- **变通方案**：用 Ctrl+Q 替代 `exit`。它会发送显式的 `CloseTerminal`，服务端能正确处理
+- **变通方案**：用 Ctrl+Q 替代 `exit`。它会发送 `CloseTerminal`、等待确认，再完成 RustDesk 连接关闭握手
 - 此问题仅影响 Windows 远端；macOS 和 Linux 远端使用 `exit` 正常工作
 
 **空闲时连接断开：**
-- 每 15 秒发送一次心跳保活；中继或服务端的超时可能更短
-- 万一真的断开，客户端会按退避策略自动重连并接回同一个会话——不想要就加 `--no-reconnect`
+- 客户端会回显 RustDesk 原生 `TestDelay` 探测，并每 5 秒发送一次需要确认的主动探测；连续 15 秒收不到确认就按断线处理
+- 万一真的断开，默认会按退避策略接回持久会话；不想重连就加 `--no-reconnect`
 - 检查中继服务器的超时配置
 
 ## 许可证

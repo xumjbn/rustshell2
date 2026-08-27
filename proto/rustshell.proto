@@ -128,6 +128,16 @@ message Hash {
   string challenge = 2;
 }
 
+// RustDesk's connection liveness probe. The controlled side sends one with
+// from_client=false and expects the client to echo it; a client-originated
+// probe uses from_client=true and is echoed by the controlled side.
+message TestDelay {
+  int64 time = 1;
+  bool from_client = 2;
+  uint32 last_delay = 3;
+  uint32 target_bitrate = 4;
+}
+
 // 只保留终端会话用得到的那一个开关。远端对终端类型的连接会把其余选项全部
 // 剥掉，所以这里也没有保留的意义。
 message OptionMessage {
@@ -261,16 +271,26 @@ message MultiClipboards {
   repeated Clipboard clipboards = 1;
 }
 
+// RustDesk's connection-level close handshake. Dropping the relay TCP stream
+// without this leaves the controlled-side server holding CLOSE_WAIT sockets.
+message Misc {
+  oneof union {
+    string close_reason = 9;
+  }
+}
+
 // ─────────────────────────── 顶层消息 ───────────────────────────
 
 message Message {
   oneof union {
     SignedId signed_id = 3;
     PublicKey public_key = 4;
+    TestDelay test_delay = 5;
     LoginRequest login_request = 7;
     LoginResponse login_response = 8;
     Hash hash = 9;
     Clipboard clipboard = 16;
+    Misc misc = 19;
     MultiClipboards multi_clipboards = 28;
     TerminalAction terminal_action = 31;
     TerminalResponse terminal_response = 32;

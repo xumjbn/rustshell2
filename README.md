@@ -42,17 +42,23 @@ Options:
   -h, --help                 Print help
 ```
 
-### Persistent sessions
+### Session lifetime
 
-The client asks the remote to keep the session alive (`terminal_persistent`) and
-reattaches to it on the next run, so the remote replays its buffered output.
-Quitting with the quit key **closes** the remote shell. Leaving it running
-instead (`--detach`) is available but costs resources on the remote: its
-connection sockets accumulate in `CLOSE_WAIT` and each surviving service keeps a
-polling thread, which given enough sessions pins a core and eventually drops the
-device off the rendezvous server. Reattach still covers the case that matters —
-an unexpected disconnect — because the client reconnects to the same session.
-Pass `--new-session` for a clean shell.
+Sessions advertise `terminal_persistent` so an abrupt disconnect remains
+reattachable. This avoids a RustDesk 1.4.6 bug: its non-persistent disconnect
+path tears down the Windows helper while holding the global terminal registry
+lock, and a stuck helper then prevents every later shell from opening. A normal
+Ctrl+Q still sends `CloseTerminal` and waits up to two seconds for confirmation.
+Every local exit then sends RustDesk's connection-level `close_reason` handshake
+before releasing the relay socket; without it, the 1.4.6 Windows server leaves
+connections in `CLOSE_WAIT`. `--detach` skips only `CloseTerminal`, leaving the
+shell alive while still closing the peer connection cleanly.
+
+`--new-session` uses a brand-new service ID instead of closing the previous
+service first. This is deliberate: RustDesk 1.4.6 can block forever while
+closing a stale Windows helper, which would prevent the following Open from
+running. On macOS/Linux, closing the local terminal window sends
+`CloseTerminal` on `SIGHUP` or `SIGTERM` unless `--detach` was requested.
 
 Each concurrent window takes its own *slot*, and a slot maps to its own remote
 session. This matters: the remote broadcasts a session's output to every client
@@ -264,12 +270,12 @@ back to detect this, so the recovery is manual.
 
 **Connection hangs after typing `exit` on Windows remote:**
 - This is a [known bug](https://github.com/rustdesk/rustdesk/blob/caadd72ab2db8cc66e3d237e3e1cb60edbab7bc5/src/server/terminal_service.rs#L1267-L1270) in the RustDesk server: Windows ConPTY does not signal EOF when the shell exits, so the server never detects the session has ended
-- **Workaround**: use Ctrl+Q instead of typing `exit`. It sends an explicit `CloseTerminal`, which the server does handle
+- **Workaround**: use Ctrl+Q instead of typing `exit`. It sends `CloseTerminal`, waits for confirmation, then performs RustDesk's connection close handshake
 - This issue only affects Windows remotes; macOS and Linux remotes work correctly with `exit`
 
 **Connection drops after idle:**
-- A keepalive heartbeat is sent every 15 seconds; the relay or server may have a shorter timeout
-- If the link does drop, the client reconnects on its own with a backoff and reattaches to the same session — pass `--no-reconnect` to turn that off
+- RustDesk `TestDelay` probes are echoed, and the client sends its own acknowledged probe every 5 seconds. A missing acknowledgement for 15 seconds is treated as a dropped connection
+- If the link drops, the client reattaches to the persistent shell with backoff. Pass `--no-reconnect` to turn reconnection off
 - Check the relay server's timeout configuration
 
 ## License

@@ -127,7 +127,10 @@ impl Link {
             .with_context(|| format!("connecting to {addr}"))?;
         // 终端流量是很多很小的包，Nagle 会把它们攒起来，直接表现为按键延迟。
         stream.set_nodelay(true).ok();
-        Ok(Self { framed: Framed::new(stream, FrameCodec::new()), cipher: None })
+        Ok(Self {
+            framed: Framed::new(stream, FrameCodec::new()),
+            cipher: None,
+        })
     }
 
     /// 启用对称加密。此后收发的每一帧都经过它。
@@ -210,8 +213,15 @@ impl Link {
         }
 
         (
-            LinkReader { framed: read, ready, cipher: cipher.clone() },
-            LinkWriter { framed: write, cipher },
+            LinkReader {
+                framed: read,
+                ready,
+                cipher: cipher.clone(),
+            },
+            LinkWriter {
+                framed: write,
+                cipher,
+            },
         )
     }
 }
@@ -309,7 +319,11 @@ mod tests {
         for tm in [1u32, 0xFFFF, 0x1234_5678, u32::MAX] {
             let raw = encode_peer_addr([192, 168, 1, 50], 21118, tm);
             let got = decode_peer_addr(&raw).expect("decodes");
-            assert_eq!(got, "192.168.1.50:21118".parse::<SocketAddr>().unwrap(), "tm={tm}");
+            assert_eq!(
+                got,
+                "192.168.1.50:21118".parse::<SocketAddr>().unwrap(),
+                "tm={tm}"
+            );
         }
     }
 
@@ -398,7 +412,11 @@ mod tests {
         let (mut reader, _writer) = link.split();
         peer.write_all(&whole[4..]).await.unwrap();
         peer.flush().await.unwrap();
-        let frame = timeout(2_000, reader.next()).await.unwrap().unwrap().unwrap();
+        let frame = timeout(2_000, reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(&frame[..], b"payload", "跨 split 边界的帧解错了");
     }
 
@@ -411,7 +429,10 @@ mod tests {
         link.set_key(key.clone());
 
         // 对端的收方向:序号从 1 开始,与我们的发方向对齐。
-        let mut peer_link = Link { framed: Framed::new(peer, FrameCodec::new()), cipher: None };
+        let mut peer_link = Link {
+            framed: Framed::new(peer, FrameCodec::new()),
+            cipher: None,
+        };
         peer_link.set_key(key);
 
         let (_reader, mut writer) = link.split();
@@ -427,8 +448,7 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("序号对不上就解不开了");
-            let parsed =
-                crate::proto::rustshell::CloseTerminal::parse_from_bytes(&got).unwrap();
+            let parsed = crate::proto::rustshell::CloseTerminal::parse_from_bytes(&got).unwrap();
             assert_eq!(parsed.terminal_id, id, "拆开之后发方向的顺序乱了");
         }
     }

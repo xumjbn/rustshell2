@@ -30,27 +30,41 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   RUSTSHELL_NEW_SESSION=(1|true), RUSTSHELL_DETACH=(1|true)"
 )]
 struct Args {
-    #[arg(short = 'i', long, default_value = "")] id: String,
-    #[arg(short = 's', long, default_value = "")] server: String,
-    #[arg(short = 'p', long, default_value = "21116")] port: u16,
-    #[arg(short = 'k', long, default_value = "")] key: String,
-    #[arg(short = 'w', long, default_value = "")] password: String,
-    #[arg(short = 'd', long, default_value = "false")] debug: bool,
-    #[arg(short = 'q', long, default_value = "q")] quit_key: char,
+    #[arg(short = 'i', long, default_value = "")]
+    id: String,
+    #[arg(short = 's', long, default_value = "")]
+    server: String,
+    #[arg(short = 'p', long, default_value = "21116")]
+    port: u16,
+    #[arg(short = 'k', long, default_value = "")]
+    key: String,
+    #[arg(short = 'w', long, default_value = "")]
+    password: String,
+    #[arg(short = 'd', long, default_value = "false")]
+    debug: bool,
+    #[arg(short = 'q', long, default_value = "q")]
+    quit_key: char,
     /// Start a fresh terminal session instead of reattaching to the persistent one
-    #[arg(short = 'n', long, default_value = "false")] new_session: bool,
+    #[arg(short = 'n', long, default_value = "false")]
+    new_session: bool,
     /// Write a plain-text transcript to this path (off unless set)
-    #[arg(short = 'l', long, default_value = "")] log_file: String,
+    #[arg(short = 'l', long, default_value = "")]
+    log_file: String,
     /// Leave the remote shell running on quit instead of closing it
-    #[arg(long, default_value = "false")] detach: bool,
+    #[arg(long, default_value = "false")]
+    detach: bool,
     /// Session slot to attach to [default: first one not in use locally]
-    #[arg(short = 't', long)] slot: Option<i32>,
+    #[arg(short = 't', long)]
+    slot: Option<i32>,
     /// Do not reconnect automatically when the connection drops
-    #[arg(long, default_value = "false")] no_reconnect: bool,
+    #[arg(long, default_value = "false")]
+    no_reconnect: bool,
     /// Draw from a screen model, giving native scrollback and the pager
-    #[arg(long, default_value = "false")] render: bool,
+    #[arg(long, default_value = "false")]
+    render: bool,
     /// 读一次本地剪贴板并报告结果，不连接。用于定位 Ctrl+V 不生效是哪一环。
-    #[arg(long, default_value = "false")] clipboard_check: bool,
+    #[arg(long, default_value = "false")]
+    clipboard_check: bool,
 }
 
 /// Why a session ended — decides whether reconnecting makes sense.
@@ -59,18 +73,14 @@ enum SessionEnd {
     UserQuit,
     /// The remote shell exited.
     RemoteClosed,
-    /// The link dropped; the remote session is likely still alive.
+    /// The link dropped; reconnect using the configured persistence policy.
     Disconnected,
 }
 
-/// Terminal `service_id` used to reattach to a persistent remote session.
+/// Stable terminal `service_id` used to isolate local slots.
 ///
-/// The remote keeps a per-`service_id` session alive with a buffer of prior
-/// output, and replays it on reattach (`TerminalOpened.replay_terminal_output`).
-/// A random id every run therefore means a brand-new session every run — no
-/// scrollback, nothing to replay. Deriving the id from (local host, device id)
-/// keeps it stable across runs without needing a state file, while staying
-/// distinct per operator machine and per remote device.
+/// A disconnected session can reattach to this ID and replay buffered output,
+/// while distinct local slots remain isolated from each other.
 fn stable_service_id(device_id: &str) -> String {
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -87,6 +97,188 @@ fn stable_service_id(device_id: &str) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+/// 每个本地槽位只对应一个可重新寻址的远端服务。
+fn slot_service_id(base: &str, slot: i32) -> String {
+    format!("{}s{}", base, slot)
+}
+
+/// A fresh session must not touch the previous service at all. RustDesk 1.4.6
+/// can wedge while closing a stale Windows helper; sending Close then Open to
+/// that service leaves Open queued forever. A new service ID bypasses the
+/// poisoned mutex while remaining stable for reconnects in this process.
+fn fresh_service_id(base: &str, slot: i32) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut h = Sha256::new();
+    h.update(b"rustshell-fresh-service-v1");
+    h.update(base.as_bytes());
+    h.update(slot.to_le_bytes());
+    h.update(std::process::id().to_le_bytes());
+    h.update(now.to_le_bytes());
+    let digest = h.finalize();
+    let mut id = slot_service_id(base, slot);
+    id.push('n');
+    for byte in &digest[..8] {
+        id.push_str(&format!("{:02x}", byte));
+    }
+    id
+}
+
+/// vt100 和远端 PTY 都不接受 0 尺寸；宽高至少为 2，避免宽字符路径做 `cols - 2`
+/// 时下溢，也避开 vt100 0.15 在单行网格滚屏时的无效行索引。
+fn normalize_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
+    (cols.max(2), rows.max(2))
+}
+
+#[cfg(test)]
+mod session_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn slot_service_id_is_stable() {
+        assert_eq!(slot_service_id("ts_base", 7), "ts_bases7");
+        assert_eq!(slot_service_id("ts_base", 7), slot_service_id("ts_base", 7));
+    }
+
+    #[test]
+    fn new_session_bypasses_the_stable_service() {
+        let stable = slot_service_id("ts_base", 7);
+        let fresh = fresh_service_id("ts_base", 7);
+        assert_ne!(fresh, stable);
+        assert!(fresh.starts_with("ts_bases7n"));
+    }
+
+    #[test]
+    fn rendered_notice_is_safe_for_a_zero_sized_test_pty() {
+        let mut screen = Screen::new(0, 0);
+        screen.passthrough = false;
+        screen.note("\n  | Tip:\n  |   command\n");
+    }
+
+    #[test]
+    fn unusable_terminal_dimensions_are_clamped() {
+        assert_eq!(normalize_terminal_size(0, 0), (2, 2));
+        assert_eq!(normalize_terminal_size(1, 20), (2, 20));
+        assert_eq!(normalize_terminal_size(120, 40), (120, 40));
+    }
+
+    #[test]
+    fn full_stdout_queue_never_blocks_the_event_loop() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        assert!(try_queue_stdout(&tx, b"first"));
+        assert!(!try_queue_stdout(&tx, b"dropped"));
+    }
+
+    #[test]
+    fn input_reader_filters_release_but_keeps_press_and_paste() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+        let press = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(input_from_event(press), Some(Input::Key(_))));
+
+        let release = Event::Key(KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(input_from_event(release).is_none());
+
+        assert!(matches!(
+            input_from_event(Event::Paste("hello".to_owned())),
+            Some(Input::Paste(text)) if text == "hello"
+        ));
+
+        // 尺寸变化过去被丢在这里，于是只能靠每 20 毫秒问一次控制台去发现。
+        assert!(
+            matches!(
+                input_from_event(Event::Resize(120, 40)),
+                Some(Input::Resize(120, 40))
+            ),
+            "Resize 必须收下，否则又要退回轮询控制台"
+        );
+    }
+
+    /// 看门狗本身也得被验一次。
+    ///
+    /// 它的全部价值在于「下次卡死时一定留下现场」。如果它悄悄不响，代价是又浪费
+    /// 一整轮复现——所以这里真的把它跑起来，真的制造一次停顿，再确认文件落了地。
+    #[test]
+    fn the_watchdog_names_the_phase_it_got_stuck_in() {
+        use std::sync::atomic::Ordering;
+
+        let path = stall::report_path();
+        let _ = std::fs::remove_file(&path);
+        stall::spawn_watchdog();
+
+        // 停在一个非空闲相位上并且不再心跳,正是卡死的样子。
+        stall::enter(stall::ABSORB);
+        std::thread::sleep(std::time::Duration::from_secs(4));
+
+        let report = std::fs::read_to_string(&path).unwrap_or_default();
+        // 让它闭嘴,免得后面的测试一直被它写文件。
+        stall::PHASE.store(stall::IDLE, Ordering::Relaxed);
+
+        assert!(
+            report.contains("absorb"),
+            "看门狗没有指认卡住的相位，取证文件内容：{report:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn graceful_disconnect_uses_rustdesk_close_reason() {
+        let encoded = close_connection_message().write_to_bytes().unwrap();
+        let decoded = Message::parse_from_bytes(&encoded).unwrap();
+        assert!(matches!(
+            decoded.union,
+            Some(message::Union::Misc(Misc {
+                union: Some(misc::Union::CloseReason(reason)),
+                ..
+            })) if reason.is_empty()
+        ));
+    }
+
+    #[test]
+    fn keepalive_is_a_real_rustdesk_liveness_probe() {
+        let encoded = keepalive_message(42).write_to_bytes().unwrap();
+        assert!(!encoded.is_empty());
+        let decoded = Message::parse_from_bytes(&encoded).unwrap();
+        assert!(matches!(
+            decoded.union,
+            Some(message::Union::TestDelay(TestDelay {
+                time: 42,
+                from_client: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn controlled_side_liveness_probe_is_echoed_unchanged() {
+        let probe = TestDelay {
+            time: 123_456,
+            from_client: false,
+            last_delay: 17,
+            target_bitrate: 2_000_000,
+            ..Default::default()
+        };
+        let encoded = echo_test_delay(probe).write_to_bytes().unwrap();
+        let decoded = Message::parse_from_bytes(&encoded).unwrap();
+        assert!(matches!(
+            decoded.union,
+            Some(message::Union::TestDelay(TestDelay {
+                time: 123_456,
+                from_client: false,
+                last_delay: 17,
+                target_bitrate: 2_000_000,
+                ..
+            }))
+        ));
+    }
 }
 
 /// zstd 压缩。对端按 `compress` 标志决定是否解压，级别随意。
@@ -110,12 +302,19 @@ fn get_pk(pk: &[u8]) -> Option<[u8; 32]> {
         let mut tmp = [0u8; 32];
         tmp[..].copy_from_slice(pk);
         Some(tmp)
-    } else { None }
+    } else {
+        None
+    }
 }
 
 fn get_rs_pk(str_base64: &str) -> Option<sign::PublicKey> {
     use base64::Engine;
-    get_pk(&base64::engine::general_purpose::STANDARD.decode(str_base64).ok()?).map(sign::PublicKey)
+    get_pk(
+        &base64::engine::general_purpose::STANDARD
+            .decode(str_base64)
+            .ok()?,
+    )
+    .map(sign::PublicKey)
 }
 
 fn decode_id_pk(signed: &[u8], key: &sign::PublicKey) -> Result<(String, [u8; 32])> {
@@ -145,11 +344,14 @@ fn key_event_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
         KeyCode::Char(c) => {
             if ctrl {
                 let c_lower = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&c_lower) { vec![(c_lower as u8) - b'a' + 1] }
-                else {
+                if ('a'..='z').contains(&c_lower) {
+                    vec![(c_lower as u8) - b'a' + 1]
+                } else {
                     match c_lower {
-                        '[' => vec![0x1b], ']' => vec![0x1d],
-                        '\\' => vec![0x1c], '^' => vec![0x1e],
+                        '[' => vec![0x1b],
+                        ']' => vec![0x1d],
+                        '\\' => vec![0x1c],
+                        '^' => vec![0x1e],
                         _ => vec![c as u8],
                     }
                 }
@@ -165,19 +367,32 @@ fn key_event_to_bytes(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
                 s.as_bytes().to_vec()
             }
         }
-        KeyCode::Enter => vec![b'\r'],       KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],          KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => vec![0x1b, b'[', b'A'], KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'], KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'], KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'], KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'], KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-        KeyCode::F(1) => vec![0x1b, b'O', b'P'], KeyCode::F(2) => vec![0x1b, b'O', b'Q'],
-        KeyCode::F(3) => vec![0x1b, b'O', b'R'], KeyCode::F(4) => vec![0x1b, b'O', b'S'],
-        KeyCode::F(5) => vec![0x1b, b'[', b'1', b'5', b'~'], KeyCode::F(6) => vec![0x1b, b'[', b'1', b'7', b'~'],
-        KeyCode::F(7) => vec![0x1b, b'[', b'1', b'8', b'~'], KeyCode::F(8) => vec![0x1b, b'[', b'1', b'9', b'~'],
-        KeyCode::F(9) => vec![0x1b, b'[', b'2', b'0', b'~'], KeyCode::F(10) => vec![0x1b, b'[', b'2', b'1', b'~'],
-        KeyCode::F(11) => vec![0x1b, b'[', b'2', b'3', b'~'], KeyCode::F(12) => vec![0x1b, b'[', b'2', b'4', b'~'],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        KeyCode::Home => vec![0x1b, b'[', b'H'],
+        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
+        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
+        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
+        KeyCode::F(1) => vec![0x1b, b'O', b'P'],
+        KeyCode::F(2) => vec![0x1b, b'O', b'Q'],
+        KeyCode::F(3) => vec![0x1b, b'O', b'R'],
+        KeyCode::F(4) => vec![0x1b, b'O', b'S'],
+        KeyCode::F(5) => vec![0x1b, b'[', b'1', b'5', b'~'],
+        KeyCode::F(6) => vec![0x1b, b'[', b'1', b'7', b'~'],
+        KeyCode::F(7) => vec![0x1b, b'[', b'1', b'8', b'~'],
+        KeyCode::F(8) => vec![0x1b, b'[', b'1', b'9', b'~'],
+        KeyCode::F(9) => vec![0x1b, b'[', b'2', b'0', b'~'],
+        KeyCode::F(10) => vec![0x1b, b'[', b'2', b'1', b'~'],
+        KeyCode::F(11) => vec![0x1b, b'[', b'2', b'3', b'~'],
+        KeyCode::F(12) => vec![0x1b, b'[', b'2', b'4', b'~'],
         _ => vec![],
     }
 }
@@ -198,16 +413,240 @@ mod win_console {
     pub const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x0008;
 }
 
-/// Write bytes to stdout.
-fn write_stdout(data: &[u8]) {
+// ── 卡死取证 ───────────────────────────────────────────────────────
+
+/// 卡死时屏幕已经不动了,日志也未必写得出去,所以停顿只能由一个不参与任何锁的
+/// 独立线程发现,并写进文件。
+///
+/// 这一套存在的理由:这个卡死改了几轮都没改对,每一轮都是靠读代码猜。猜错的成本
+/// 是一整轮返工,而现场其实什么都没留下——屏幕不动、日志停在半路,分不清是收不
+/// 到帧、画不出来,还是卡在某个同步系统调用里。有了相位标记,下一次复现就能直接
+/// 指认,不用再猜。
+mod stall {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// 主循环每走一步就加一,看门狗靠它判断有没有在动。
+    pub static BEAT: AtomicU64 = AtomicU64::new(0);
+    /// 主循环当前所处的相位,取值是 PHASES 的下标。
+    pub static PHASE: AtomicUsize = AtomicUsize::new(0);
+    /// stdout 线程同样一套,用来区分「主循环卡住」和「控制台写不动」。
+    pub static OUT_BEAT: AtomicU64 = AtomicU64::new(0);
+    pub static OUT_PHASE: AtomicUsize = AtomicUsize::new(0);
+    /// 因为队列满被丢掉的帧数,以及还排在队列里的字节数。
+    pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+    pub static QUEUED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub const PHASES: &[&str] = &[
+        "启动",
+        "select 等待(正常空闲)",
+        "absorb 吸收远端字节",
+        "flush 渲染一帧",
+        "repaint 整屏重画",
+        "feed_replay 处理回放",
+        "crossterm::terminal::size() 查询控制台尺寸",
+        "读本地剪贴板(arboard)",
+        "剪贴板发送后的固定等待",
+        "处理本地按键",
+        "关闭连接：等写任务把 CloseTerminal 冲上线",
+        "退出：恢复本地终端模式",
+        "退出：关闭 tokio 运行时",
+    ];
+    pub const IDLE: usize = 1;
+    pub const ABSORB: usize = 2;
+    pub const FLUSH: usize = 3;
+    pub const REPAINT: usize = 4;
+    pub const REPLAY: usize = 5;
+    pub const SIZE_QUERY: usize = 6;
+    pub const CLIPBOARD: usize = 7;
+    pub const CLIP_WAIT: usize = 8;
+    pub const INPUT: usize = 9;
+    pub const CLOSING: usize = 10;
+    pub const EXIT_CONSOLE: usize = 11;
+    pub const EXIT_RUNTIME: usize = 12;
+
+    pub const OUT_PHASES: &[&str] = &["空闲", "写控制台(write_all)", "冲刷控制台(flush)"];
+    pub const OUT_IDLE: usize = 0;
+    pub const OUT_WRITE: usize = 1;
+    pub const OUT_FLUSH: usize = 2;
+
+    /// 进入一个相位。只有一次 relaxed store,放在热路径上也不心疼。
+    pub fn enter(phase: usize) {
+        PHASE.store(phase, Ordering::Relaxed);
+        BEAT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn out_enter(phase: usize) {
+        OUT_PHASE.store(phase, Ordering::Relaxed);
+        OUT_BEAT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn name(table: &[&str], index: usize) -> String {
+        table
+            .get(index)
+            .map(|s| (*s).to_owned())
+            .unwrap_or_else(|| format!("未知({index})"))
+    }
+
+    /// 停顿超过这个时长就认为卡死了。正常一帧几毫秒,空闲时相位是「select 等待」
+    /// 且心跳照常在动,所以不会误报。
+    const STALL: std::time::Duration = std::time::Duration::from_secs(3);
+
+    pub fn report_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rustshell-stall-{}.log", std::process::id()))
+    }
+
+    /// 起看门狗。它不碰终端、不碰任何业务锁,只读原子量和写文件。
+    pub fn spawn_watchdog() {
+        let path = report_path();
+        std::thread::Builder::new()
+            .name("rustshell-watchdog".to_owned())
+            .spawn(move || {
+                use std::io::Write;
+                let mut last = (0_u64, 0_u64);
+                let mut moved_at = std::time::Instant::now();
+                let mut reported_at: Option<std::time::Instant> = None;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let now = (BEAT.load(Ordering::Relaxed), OUT_BEAT.load(Ordering::Relaxed));
+                    let phase = PHASE.load(Ordering::Relaxed);
+                    // 两种「不动」是正常的:一是主循环停在 select 上等事件,二是
+                    // 会话还没开始——连接和握手本来就可能慢到十几秒,那段时间相位
+                    // 一直是「启动」,不该报。
+                    let idle = phase == IDLE || phase == 0;
+                    if now != last || idle {
+                        last = now;
+                        moved_at = std::time::Instant::now();
+                        reported_at = None;
+                        continue;
+                    }
+                    let stuck = moved_at.elapsed();
+                    if stuck < STALL {
+                        continue;
+                    }
+                    // 卡住期间每 5 秒记一次,既能看出是持续卡还是偶发顿。
+                    if reported_at.is_some_and(|t| {
+                        t.elapsed() < std::time::Duration::from_secs(5)
+                    }) {
+                        continue;
+                    }
+                    let first = reported_at.is_none();
+                    reported_at = Some(std::time::Instant::now());
+                    let line = format!(
+                        "[{:?} 无进展] 主循环相位={} | stdout 线程相位={} | 已丢帧={} | 队列积压={} 字节\n",
+                        stuck,
+                        name(PHASES, phase),
+                        name(OUT_PHASES, OUT_PHASE.load(Ordering::Relaxed)),
+                        DROPPED.load(Ordering::Relaxed),
+                        QUEUED_BYTES.load(Ordering::Relaxed),
+                    );
+                    // 屏幕多半已经死了,所以写文件;stderr 也写一份,重定向到文件时更省事。
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = f.write_all(line.as_bytes());
+                    }
+                    // 屏幕这时多半已经不动了，但万一还能显示，第一条要告诉用户
+                    // 取证文件在哪。用 \r\n 是因为终端处于原始模式。
+                    if first {
+                        eprint!("\r\n[rustshell 卡死取证] 详情写入 {}\r\n", path.display());
+                    }
+                    eprint!("\r\n[rustshell 卡死取证] {line}");
+                }
+            })
+            .expect("start stall watchdog");
+    }
+}
+
+enum StdoutCommand {
+    Write(Vec<u8>),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+fn stdout_sender() -> &'static std::sync::mpsc::SyncSender<StdoutCommand> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<StdoutCommand>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        // 四秒左右的完整帧余量。队列满时宁可丢一帧并在下一帧整屏重画，也不能让
+        // stdout 反压堵住网络与输入循环，否则连 Ctrl+Q 都读不到。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StdoutCommand>(64);
+        std::thread::Builder::new()
+            .name("rustshell-stdout".to_owned())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    let mut stdout = std::io::stdout();
+                    match command {
+                        StdoutCommand::Write(data) => {
+                            // 写控制台是同步系统调用,在 Windows 上还要抢控制台
+                            // 锁。它卡住时整个窗口就不动了,所以单独标一个相位。
+                            stall::out_enter(stall::OUT_WRITE);
+                            stdout.write_all(&data).ok();
+                            stall::out_enter(stall::OUT_FLUSH);
+                            stdout.flush().ok();
+                            stall::QUEUED_BYTES
+                                .fetch_sub(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            stall::out_enter(stall::OUT_IDLE);
+                        }
+                        StdoutCommand::Flush(done) => {
+                            stall::out_enter(stall::OUT_FLUSH);
+                            stdout.flush().ok();
+                            done.try_send(()).ok();
+                            stall::out_enter(stall::OUT_IDLE);
+                        }
+                    }
+                }
+            })
+            .expect("start stdout worker");
+        tx
+    })
+}
+
+/// 把字节交给独立 stdout 线程；返回 false 表示本帧因本地终端反压被丢弃。
+///
+/// 丢帧过去是完全静默的。屏幕停住时分不清是没收到数据还是收到了画不出去,而这
+/// 两者的修法完全相反——所以丢一帧必须留下痕迹。
+fn try_queue_stdout(sender: &std::sync::mpsc::SyncSender<StdoutCommand>, data: &[u8]) -> bool {
+    use std::sync::atomic::Ordering;
+    let n = data.len() as u64;
+    match sender.try_send(StdoutCommand::Write(data.to_vec())) {
+        Ok(()) => {
+            stall::QUEUED_BYTES.fetch_add(n, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            let dropped = stall::DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+            // 刷屏时丢帧会连成一片,全记下来只会把日志淹掉;按 2 的幂记一次,
+            // 既能看出「开始丢了」也能看出量级。
+            if dropped.is_power_of_two() {
+                log::warn!(
+                    "本地终端跟不上：已丢弃 {dropped} 帧输出（队列积压 {} 字节）",
+                    stall::QUEUED_BYTES.load(Ordering::Relaxed)
+                );
+            }
+            false
+        }
+    }
+}
+
+fn write_stdout(data: &[u8]) -> bool {
     // Tests drive the renderer directly and assert on the models; letting
     // control sequences reach the real stdout just shreds the test report.
     if cfg!(test) {
+        return true;
+    }
+    try_queue_stdout(stdout_sender(), data)
+}
+
+/// 尽力等 stdout 队列落地，但绝不让退出再次被堵死。
+fn flush_stdout() {
+    if cfg!(test) {
         return;
     }
-    let mut stdout = std::io::stdout();
-    stdout.write_all(data).ok();
-    stdout.flush().ok();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if stdout_sender().try_send(StdoutCommand::Flush(tx)).is_ok() {
+        let _ = rx.recv_timeout(std::time::Duration::from_millis(250));
+    }
 }
 
 // ── Terminal setup ─────────────────────────────────────────────────
@@ -215,8 +654,7 @@ fn write_stdout(data: &[u8]) {
 struct ConsoleGuard;
 impl ConsoleGuard {
     fn enable() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()
-            .context("Failed to enable raw mode")?;
+        crossterm::terminal::enable_raw_mode().context("Failed to enable raw mode")?;
         // Without this the local terminal delivers a paste as a burst of
         // individual key events, so we cannot tell pasted text from typing and
         // the remote sees a multi-line paste as line-by-line input.
@@ -229,9 +667,11 @@ impl ConsoleGuard {
             let handle = win_console::GetStdHandle(win_console::STD_OUTPUT_HANDLE);
             let mut mode: u32 = 0;
             if win_console::GetConsoleMode(handle, &mut mode) != 0 {
-                win_console::SetConsoleMode(handle, mode
-                    | win_console::ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                    | win_console::DISABLE_NEWLINE_AUTO_RETURN);
+                win_console::SetConsoleMode(
+                    handle,
+                    mode | win_console::ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                        | win_console::DISABLE_NEWLINE_AUTO_RETURN,
+                );
             }
         }
         Ok(Self)
@@ -239,8 +679,11 @@ impl ConsoleGuard {
 }
 impl Drop for ConsoleGuard {
     fn drop(&mut self) {
-        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste).ok();
+        // 先恢复输入模式。stdout 线程若正在被终端反压，直接 execute 会在这里再次
+        // 卡住；控制序列也走非阻塞队列，并只做有上限的等待。
         let _ = crossterm::terminal::disable_raw_mode();
+        write_stdout(b"\x1b[?2004l");
+        flush_stdout();
     }
 }
 
@@ -249,37 +692,55 @@ enum Input {
     Key(crossterm::event::KeyEvent),
     /// A whole clipboard paste, delivered in one piece by bracketed paste.
     Paste(String),
+    /// 终端改了尺寸，(cols, rows)。
+    Resize(u16, u16),
 }
 
-/// Poll local input (cross-platform, uses crossterm).
+type InputResult = std::result::Result<Input, String>;
+
+/// Keep the blocking terminal reader outside Tokio and outside reconnects.
 ///
-/// Returns events rather than encoded bytes: the scrollback viewer needs to see
-/// modifiers to decide whether a key is for it or for the remote, and a paste
-/// has to stay whole rather than being replayed as keystrokes.
-fn poll_input() -> Option<Input> {
-    use crossterm::event::{self, Event, KeyEventKind};
-    // 一轮最多处理这么多事件。返回 None 是调用方停止排空的信号,所以必须有个
-    // 上限保证一定回得去——否则事件源一直有货就再也回不到收发循环。
-    const MAX_SKIP: usize = 512;
-    for _ in 0..MAX_SKIP {
-        if !event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
-            return None;
-        }
-        match event::read() {
-            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => return Some(Input::Key(k)),
-            Ok(Event::Paste(s)) => return Some(Input::Paste(s)),
-            // 不关心的事件要跳过去接着取,不能当成「没有输入了」。
-            //
-            // 调用方是 `while let Some(_) = poll_input()`,在这里返回 None 会
-            // 让整轮排空提前结束。而 Windows 上每次按键都跟着一个 Release 事
-            // 件,再加上 Resize、焦点变化,几乎每一轮都会被截断——输入于是被
-            // 限速到每个 20ms tick 一个事件,多出来的堆在控制台队列里越积越
-            // 多,表现就是「敲不进去」。
-            Ok(_) => continue,
-            Err(_) => return None,
-        }
+/// `event::read()` cannot be cancelled reliably on every terminal. The reader
+/// thread is therefore process-scoped and deliberately detached: dropping the
+/// receiver makes future sends fail, and a blocked read can never hold up
+/// Ctrl+Q, a process signal, network handling, or process shutdown.
+fn spawn_input_reader() -> tokio::sync::mpsc::UnboundedReceiver<InputResult> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name("rustshell-input".to_owned())
+        .spawn(move || loop {
+            match crossterm::event::read() {
+                Ok(event) => {
+                    if let Some(input) = input_from_event(event) {
+                        if tx.send(Ok(input)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        })
+        .expect("start terminal input reader");
+    rx
+}
+
+/// 只把业务关心的终端事件放进发送队列。
+///
+/// Resize 过去在这里被丢掉，改尺寸靠主循环每 20 毫秒调一次
+/// `crossterm::terminal::size()` 去发现。那个调用在 Windows 上要打开 CONOUT$
+/// 并取控制台锁，而 stdout 线程正拿着同一把锁往控制台里灌字节——刷屏时每秒五十
+/// 次去抢它，纯属自找。终端本来就会把尺寸变化当成事件送过来，收下即可。
+fn input_from_event(event: crossterm::event::Event) -> Option<Input> {
+    use crossterm::event::{Event, KeyEventKind};
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => Some(Input::Key(key)),
+        Event::Paste(text) => Some(Input::Paste(text)),
+        Event::Resize(cols, rows) => Some(Input::Resize(cols, rows)),
+        _ => None,
     }
-    None
 }
 
 // ── Scrollback viewer ──────────────────────────────────────────────
@@ -306,7 +767,9 @@ const SCROLLBACK_LINES: usize = 10_000;
 /// Byte order passes through unchanged: RGBA in, RGBA out, no swap.
 fn clipboard_image_message() -> Result<(Message, usize, u32, u32)> {
     let mut clipboard = arboard::Clipboard::new().context("open the local clipboard")?;
-    let image = clipboard.get_image().context("no image on the local clipboard")?;
+    let image = clipboard
+        .get_image()
+        .context("no image on the local clipboard")?;
     build_clipboard_image(&image.bytes, image.width, image.height)
 }
 
@@ -322,7 +785,10 @@ fn build_clipboard_image(bytes: &[u8], w: usize, h: usize) -> Result<(Message, u
     // 用户一分钟的链路。
     const MAX_RAW: usize = 128 * 1024 * 1024;
     if bytes.len() > MAX_RAW {
-        bail!("clipboard image is {} bytes, too large to send", bytes.len());
+        bail!(
+            "clipboard image is {} bytes, too large to send",
+            bytes.len()
+        );
     }
     if bytes.len() != w * h * 4 {
         bail!("RGBA length {} does not match {w}x{h}", bytes.len());
@@ -469,6 +935,8 @@ struct Screen {
     status: Option<(String, std::time::Instant)>,
     /// Bytes straight to the terminal, no modelling.
     passthrough: bool,
+    /// stdout 队列曾丢帧；下一次渲染必须整屏重画，不能继续基于旧 host 做 diff。
+    output_dirty: bool,
     /// vt100 history length as of the last absorb.
     drawn_history: usize,
     /// 上一次 absorb 看到的备用屏幕状态。
@@ -486,6 +954,7 @@ struct Screen {
 
 impl Screen {
     fn new(rows: u16, cols: u16) -> Self {
+        let (cols, rows) = normalize_terminal_size(cols, rows);
         Self {
             model: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             // The real terminal keeps the main screen's history, and our own
@@ -500,6 +969,7 @@ impl Screen {
             alt: false,
             status: None,
             passthrough: true,
+            output_dirty: false,
             drawn_history: 0,
             absorb_alt: false,
             pending: Vec::new(),
@@ -516,8 +986,11 @@ impl Screen {
         if bytes.is_empty() {
             return;
         }
-        write_stdout(bytes);
-        self.host.process(bytes);
+        if write_stdout(bytes) {
+            self.host.process(bytes);
+        } else {
+            self.output_dirty = true;
+        }
     }
 
     /// 把字节攒进本帧的输出缓冲，并让 host 模型立刻跟上。
@@ -536,9 +1009,14 @@ impl Screen {
     fn set_status(&mut self, text: impl Into<String>) {
         if self.passthrough {
             let t = text.into();
-            write_stdout(format!("
+            write_stdout(
+                format!(
+                    "
 [rustshell] {t}
-").as_bytes());
+"
+                )
+                .as_bytes(),
+            );
             return;
         }
         self.status = Some((text.into(), std::time::Instant::now()));
@@ -752,6 +1230,10 @@ impl Screen {
             self.repaint(false);
             return;
         }
+        if self.output_dirty {
+            self.repaint(false);
+            return;
+        }
 
         // 一帧只写一次。原先退役滚动、diff、状态行各写一次、各 flush 一次,
         // 三趟系统调用;Windows 控制台上这个往返不便宜,而且中间态会闪。
@@ -784,7 +1266,11 @@ impl Screen {
         if let Some(line) = &status {
             self.stage(&mut frame, line);
         }
-        write_stdout(&frame);
+        if !write_stdout(&frame) {
+            // stage 已经按“成功写出”推进了 host；丢帧后必须废弃这个基准。
+            self.host = vt100::Parser::new(self.rows, self.cols, 0);
+            self.output_dirty = true;
+        }
 
         // 状态行刚过期：屏幕上还留着它，只能整屏重画抹掉。
         if status.is_none() && self.status.is_some() {
@@ -827,6 +1313,7 @@ impl Screen {
 
     /// 返回 true 表示需要请远端重画一次。
     fn resize(&mut self, rows: u16, cols: u16) -> bool {
+        let (cols, rows) = normalize_terminal_size(cols, rows);
         if self.passthrough {
             self.rows = rows;
             self.cols = cols;
@@ -856,6 +1343,15 @@ impl Screen {
         self.repaint(false);
         // 本地已经按模型画好了，不必劳烦远端。
         false
+    }
+
+    /// 上一次写没能交出去，屏幕上留着的是旧内容。
+    ///
+    /// 这个状态过去只能等下一帧远端数据来推动。可是刷屏卡住时最后一帧往往正好
+    /// 是被丢掉的那一帧，而应用画完就安静了——于是屏幕永远停在半张画面上,
+    /// 看着和死了一样，其实链路好好的。要自己爬回来。
+    fn needs_repaint(&self) -> bool {
+        !self.passthrough && self.output_dirty
     }
 
     fn active(&self) -> bool {
@@ -964,7 +1460,12 @@ impl Screen {
         if let Some(line) = self.status_line() {
             out.extend_from_slice(&line);
         }
-        self.emit(&out);
+        if write_stdout(&out) {
+            self.host.process(&out);
+            self.output_dirty = false;
+        } else {
+            self.output_dirty = true;
+        }
     }
 }
 
@@ -988,8 +1489,15 @@ fn scrollback_key(ev: &crossterm::event::KeyEvent) -> Option<i32> {
 // ── Stream helpers ─────────────────────────────────────────────────
 
 async fn recv_raw(conn: &mut Link, step: &str) -> Result<bytes::BytesMut> {
-    match conn.next().await {
-        Some(Ok(b)) => { log::debug!("[{step}] received {} bytes", b.len()); Ok(b) }
+    const RECEIVE_TIMEOUT_MS: u64 = 15_000;
+    match timeout(RECEIVE_TIMEOUT_MS, conn.next())
+        .await
+        .with_context(|| format!("Timed out during {step}"))?
+    {
+        Some(Ok(b)) => {
+            log::debug!("[{step}] received {} bytes", b.len());
+            Ok(b)
+        }
         Some(Err(e)) => bail!("[{step}] stream error: {e}"),
         None => bail!("[{step}] connection closed by peer"),
     }
@@ -997,8 +1505,7 @@ async fn recv_raw(conn: &mut Link, step: &str) -> Result<bytes::BytesMut> {
 
 async fn recv_msg(conn: &mut Link, step: &str) -> Result<Message> {
     let bytes = recv_raw(conn, step).await?;
-    Message::parse_from_bytes(&bytes)
-        .with_context(|| format!("[{step}] failed to parse Message"))
+    Message::parse_from_bytes(&bytes).with_context(|| format!("[{step}] failed to parse Message"))
 }
 
 async fn recv_rendezvous_msg(conn: &mut Link, step: &str) -> Result<RendezvousMessage> {
@@ -1008,7 +1515,8 @@ async fn recv_rendezvous_msg(conn: &mut Link, step: &str) -> Result<RendezvousMe
 }
 
 async fn send_msg(conn: &mut Link, msg: &impl ProtoMessage, step: &str) -> Result<()> {
-    timeout(CONNECT_TIMEOUT, conn.send(msg)).await
+    timeout(CONNECT_TIMEOUT, conn.send(msg))
+        .await
         .with_context(|| format!("[{step}] timeout sending message"))??;
     log::debug!("[{step}] sent message");
     Ok(())
@@ -1027,19 +1535,67 @@ fn main() {
     let mut args = Args::parse();
 
     // Fill empty fields from RUSTSHELL_* environment variables
-    if args.id.is_empty() { args.id = std::env::var("RUSTSHELL_ID").unwrap_or_default(); }
-    if args.server.is_empty() { args.server = std::env::var("RUSTSHELL_SERVER").unwrap_or_default(); }
-    if args.port == 21116 { if let Ok(v) = std::env::var("RUSTSHELL_PORT") { if let Ok(p) = v.parse() { args.port = p; } } }
-    if args.key.is_empty() { args.key = std::env::var("RUSTSHELL_KEY").unwrap_or_default(); }
-    if !args.debug { args.debug = std::env::var("RUSTSHELL_DEBUG").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
-    if args.password.is_empty() { args.password = std::env::var("RUSTSHELL_PASSWORD").unwrap_or_default(); }
-    if args.quit_key == 'q' { if let Ok(v) = std::env::var("RUSTSHELL_QUIT_KEY") { if let Some(c) = v.chars().next() { args.quit_key = c; } } }
-    if !args.new_session { args.new_session = std::env::var("RUSTSHELL_NEW_SESSION").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
-    if args.log_file.is_empty() { args.log_file = std::env::var("RUSTSHELL_LOG_FILE").unwrap_or_default(); }
-    if !args.detach { args.detach = std::env::var("RUSTSHELL_DETACH").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
-    if args.slot.is_none() { if let Ok(v) = std::env::var("RUSTSHELL_SLOT") { if let Ok(n) = v.parse() { args.slot = Some(n); } } }
-    if !args.render { args.render = std::env::var("RUSTSHELL_RENDER").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
-    if !args.no_reconnect { args.no_reconnect = std::env::var("RUSTSHELL_NO_RECONNECT").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false); }
+    if args.id.is_empty() {
+        args.id = std::env::var("RUSTSHELL_ID").unwrap_or_default();
+    }
+    if args.server.is_empty() {
+        args.server = std::env::var("RUSTSHELL_SERVER").unwrap_or_default();
+    }
+    if args.port == 21116 {
+        if let Ok(v) = std::env::var("RUSTSHELL_PORT") {
+            if let Ok(p) = v.parse() {
+                args.port = p;
+            }
+        }
+    }
+    if args.key.is_empty() {
+        args.key = std::env::var("RUSTSHELL_KEY").unwrap_or_default();
+    }
+    if !args.debug {
+        args.debug = std::env::var("RUSTSHELL_DEBUG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
+    if args.password.is_empty() {
+        args.password = std::env::var("RUSTSHELL_PASSWORD").unwrap_or_default();
+    }
+    if args.quit_key == 'q' {
+        if let Ok(v) = std::env::var("RUSTSHELL_QUIT_KEY") {
+            if let Some(c) = v.chars().next() {
+                args.quit_key = c;
+            }
+        }
+    }
+    if !args.new_session {
+        args.new_session = std::env::var("RUSTSHELL_NEW_SESSION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
+    if args.log_file.is_empty() {
+        args.log_file = std::env::var("RUSTSHELL_LOG_FILE").unwrap_or_default();
+    }
+    if !args.detach {
+        args.detach = std::env::var("RUSTSHELL_DETACH")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
+    if args.slot.is_none() {
+        if let Ok(v) = std::env::var("RUSTSHELL_SLOT") {
+            if let Ok(n) = v.parse() {
+                args.slot = Some(n);
+            }
+        }
+    }
+    if !args.render {
+        args.render = std::env::var("RUSTSHELL_RENDER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
+    if !args.no_reconnect {
+        args.no_reconnect = std::env::var("RUSTSHELL_NO_RECONNECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
 
     if args.clipboard_check {
         match clipboard_image_message() {
@@ -1051,22 +1607,43 @@ fn main() {
         return;
     }
 
-    if args.id.is_empty() { eprintln!("Error: --id or RUSTSHELL_ID is required"); std::process::exit(1); }
-    if args.server.is_empty() { eprintln!("Error: --server or RUSTSHELL_SERVER is required"); std::process::exit(1); }
-    if !args.quit_key.is_ascii_alphabetic() { eprintln!("Error: --quit-key must be an ASCII letter a-z"); std::process::exit(1); }
+    if args.id.is_empty() {
+        eprintln!("Error: --id or RUSTSHELL_ID is required");
+        std::process::exit(1);
+    }
+    if args.server.is_empty() {
+        eprintln!("Error: --server or RUSTSHELL_SERVER is required");
+        std::process::exit(1);
+    }
+    if !args.quit_key.is_ascii_alphabetic() {
+        eprintln!("Error: --quit-key must be an ASCII letter a-z");
+        std::process::exit(1);
+    }
 
     let log_level = if args.debug { "debug" } else { "info" };
-    env_logger::init_from_env(env_logger::Env::default().filter_or("RUST_LOG", log_level));
+    // Raw terminal mode disables the usual LF -> CRLF translation. Without an
+    // explicit carriage return, any log emitted while the session is active
+    // starts at the previous cursor column and corrupts the rendered screen.
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().filter_or("RUST_LOG", log_level));
+    logger.format_suffix("\r\n").init();
 
     let password = if args.password.is_empty() {
         match rpassword::prompt_password("Enter password: ") {
             Ok(p) => p,
-            Err(e) => { eprintln!("Failed to read password: {}", e); std::process::exit(1); }
+            Err(e) => {
+                eprintln!("Failed to read password: {}", e);
+                std::process::exit(1);
+            }
         }
-    } else { args.password };
+    } else {
+        args.password
+    };
 
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all().build().expect("tokio runtime");
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
 
     // Opt-in only. Writing a transcript per run by default silently filled the
     // user's home directory with megabytes of logs nobody asked for.
@@ -1087,28 +1664,64 @@ fn main() {
     // even with distinct terminal_ids. Isolation has to happen here: one
     // service_id per slot, stable per slot so each window reattaches to its own.
     let service_id = if args.new_session {
-        format!("ts_{}", uuid::Uuid::new_v4())
+        fresh_service_id(&base, slot.id)
     } else {
-        format!("{}s{}", base, slot.id)
+        slot_service_id(&base, slot.id)
     };
     log::info!(
         "Terminal session: {} (slot {}, {})",
-        service_id, slot.id,
-        if args.new_session { "new" } else { "reattach if it exists" }
+        service_id,
+        slot.id,
+        if args.new_session {
+            "new"
+        } else {
+            "reattach if it exists"
+        }
     );
 
     let mut attempt: u32 = 0;
+    let mut failed = false;
+    let mut fresh_open = args.new_session;
+    let _console_guard = match ConsoleGuard::enable() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::exit(1);
+        }
+    };
+    let mut input_events = spawn_input_reader();
+    // 卡死过好几轮都没定位到,靠的都是读代码猜。这个线程不参与任何锁,停顿超过
+    // 三秒就把当时的相位写进文件,下次复现直接看它。
+    stall::spawn_watchdog();
+    // 记 info 而不是 debug：不带 -d 的日志也要能一眼看出跑的是带取证的版本。
+    log::info!("卡死取证文件: {}", stall::report_path().display());
     loop {
         let outcome = rt.block_on(run(
-            args.id.clone(), args.key.clone(), args.server.clone(), args.port,
-            password.clone(), args.quit_key, service_id.clone(), &slot,
-            log_path.clone(), args.detach, args.render, args.new_session,
+            args.id.clone(),
+            args.key.clone(),
+            args.server.clone(),
+            args.port,
+            password.clone(),
+            args.quit_key,
+            service_id.clone(),
+            &slot,
+            log_path.clone(),
+            args.detach,
+            args.render,
+            fresh_open,
+            &mut input_events,
         ));
-        let _ = crossterm::terminal::disable_raw_mode();
+        // A reconnect always targets the same persistent service and replays
+        // its buffered output. Only the first --new-session open is fresh.
+        fresh_open = false;
 
         let should_retry = match &outcome {
-            Ok(SessionEnd::UserQuit) => { break; }
-            Ok(SessionEnd::RemoteClosed) => { break; }
+            Ok(SessionEnd::UserQuit) => {
+                break;
+            }
+            Ok(SessionEnd::RemoteClosed) => {
+                break;
+            }
             Ok(SessionEnd::Disconnected) => true,
             Err(e) => {
                 eprintln!("\r\nError: {:#}", e);
@@ -1119,42 +1732,85 @@ fn main() {
         };
 
         if !should_retry || args.no_reconnect {
-            if matches!(outcome, Err(_)) { std::process::exit(1); }
+            // 这里过去直接 process::exit(1)。那会跳过所有析构，包括把终端从
+            // raw mode 放回去的那个——连不上服务器之后，用户的 shell 就不回显
+            // 了，得自己 `reset`。改成记下来，走完统一的收尾再带着退出码走。
+            failed = matches!(outcome, Err(_));
             break;
         }
 
         attempt += 1;
         // 2s, 4s, 8s ... capped at 30s.
         let delay = std::cmp::min(2u64.saturating_pow(attempt.min(5)), 30);
-        eprintln!("\r\nConnection lost. Reconnecting in {}s (attempt {})...", delay, attempt);
+        eprintln!(
+            "\r\nConnection lost. Reconnecting in {}s (attempt {})...",
+            delay, attempt
+        );
         std::thread::sleep(std::time::Duration::from_secs(delay));
+    }
+
+    // 退出路径上的每一步都要有上限，而且要能在日志里认出来。
+    //
+    // 现场记录过一次：SIGTERM 的处理日志已经打出来了，进程却再也没退，只能补一
+    // 刀。会话循环里的收尾本来就步步有超时，剩下没有上限的就是这两步——恢复终端
+    // 模式要等 stdout 线程，而 drop 运行时会一直等到所有工作线程停妥。链路已经
+    // 废掉时，这两处都可能永远等下去。
+    log::info!("会话结束，正在恢复本地终端...");
+    stall::enter(stall::EXIT_CONSOLE);
+    drop(_console_guard);
+
+    log::info!("正在关闭运行时...");
+    stall::enter(stall::EXIT_RUNTIME);
+    // 用带上限的关闭代替隐式 drop。到点仍没停妥的任务被就地丢下——此刻已经没有
+    // 任何东西依赖它们，而「退不出去」比「少收一个尾」严重得多。
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
+    log::info!("已退出");
+    if failed {
+        std::process::exit(1);
     }
 }
 
 async fn run(
-    device_id: String, licence_key: String,
-    server: String, port: u16, password: String,
-    quit_key: char, service_id: String, slot: &TerminalSlot,
-    log_path: Option<std::path::PathBuf>, detach: bool, render: bool, new_session: bool,
+    device_id: String,
+    licence_key: String,
+    server: String,
+    port: u16,
+    password: String,
+    quit_key: char,
+    service_id: String,
+    slot: &TerminalSlot,
+    log_path: Option<std::path::PathBuf>,
+    detach: bool,
+    render: bool,
+    fresh_open: bool,
+    input_events: &mut tokio::sync::mpsc::UnboundedReceiver<InputResult>,
 ) -> Result<SessionEnd> {
     let rendezvous_addr = format!("{}:{}", server, port);
     log::info!("Connecting to rendezvous server {}...", rendezvous_addr);
 
     // Phase 1: Connect to rendezvous server
-    let mut socket = Link::connect(&rendezvous_addr.clone(), CONNECT_TIMEOUT).await
+    let mut socket = Link::connect(&rendezvous_addr.clone(), CONNECT_TIMEOUT)
+        .await
         .with_context(|| format!("Failed to connect to {}", rendezvous_addr))?;
     log::info!("TCP connected to rendezvous server");
 
-    let key_str: &str = if licence_key.is_empty() { RS_PUB_KEY } else { &licence_key };
+    let key_str: &str = if licence_key.is_empty() {
+        RS_PUB_KEY
+    } else {
+        &licence_key
+    };
     attempt_secure_tcp(&mut socket, key_str).await?;
 
     // Send PunchHoleRequest
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_punch_hole_request(PunchHoleRequest {
-        id: device_id.clone(), licence_key: licence_key.clone(),
+        id: device_id.clone(),
+        licence_key: licence_key.clone(),
         conn_type: ConnType::TERMINAL.into(),
-        nat_type: NatType::SYMMETRIC.into(), force_relay: false,
-        version: VERSION.to_owned(), ..Default::default()
+        nat_type: NatType::SYMMETRIC.into(),
+        force_relay: false,
+        version: VERSION.to_owned(),
+        ..Default::default()
     });
     log::info!("Requesting connection to device {}...", device_id);
     send_msg(&mut socket, &msg_out, "punch_hole_request").await?;
@@ -1166,8 +1822,15 @@ async fn run(
             if let Some(addr) = link::decode_peer_addr(&ph.socket_addr) {
                 let relay = if ph.relay_server.is_empty() {
                     increase_port(&rendezvous_addr, 1)
-                } else { check_port(ph.relay_server.clone(), RELAY_PORT) };
-                log::info!("Peer address: {} (local: {}), relay fallback: {}", addr, ph.is_local(), relay);
+                } else {
+                    check_port(ph.relay_server.clone(), RELAY_PORT)
+                };
+                log::info!(
+                    "Peer address: {} (local: {}), relay fallback: {}",
+                    addr,
+                    ph.is_local(),
+                    relay
+                );
                 (ph.pk.to_vec(), relay, String::new(), Some(addr))
             } else {
                 use punch_hole_response::Failure;
@@ -1184,7 +1847,9 @@ async fn run(
         Some(rendezvous_message::Union::RelayResponse(rr)) => {
             let relay = if rr.relay_server.is_empty() {
                 increase_port(&rendezvous_addr, 1)
-            } else { check_port(rr.relay_server, RELAY_PORT) };
+            } else {
+                check_port(rr.relay_server, RELAY_PORT)
+            };
             log::info!("Relay assigned: {} (uuid: {})", relay, rr.uuid);
             let pk = match rr.union {
                 Some(relay_response::Union::Pk(pk)) => pk.to_vec(),
@@ -1205,15 +1870,22 @@ async fn run(
                 c
             }
             Err(e) => {
-                log::info!("Direct failed ({}), falling back to relay {}", e, relay_server);
-                let mut c = Link::connect(&relay_server.clone(), CONNECT_TIMEOUT).await
+                log::info!(
+                    "Direct failed ({}), falling back to relay {}",
+                    e,
+                    relay_server
+                );
+                let mut c = Link::connect(&relay_server.clone(), CONNECT_TIMEOUT)
+                    .await
                     .with_context(|| format!("Failed to connect to relay {}", relay_server))?;
                 // Send RequestRelay for relay
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_request_relay(RequestRelay {
-                    id: device_id.clone(), uuid: relay_uuid,
+                    id: device_id.clone(),
+                    uuid: relay_uuid,
                     licence_key: licence_key.clone(),
-                    conn_type: ConnType::TERMINAL.into(), ..Default::default()
+                    conn_type: ConnType::TERMINAL.into(),
+                    ..Default::default()
                 });
                 send_msg(&mut c, &msg_out, "request_relay").await?;
                 c
@@ -1221,13 +1893,16 @@ async fn run(
         }
     } else {
         log::info!("Connecting via relay server {}...", relay_server);
-        let mut c = Link::connect(&relay_server.clone(), CONNECT_TIMEOUT).await
+        let mut c = Link::connect(&relay_server.clone(), CONNECT_TIMEOUT)
+            .await
             .with_context(|| format!("Failed to connect to relay {}", relay_server))?;
         let mut msg_out = RendezvousMessage::new();
         msg_out.set_request_relay(RequestRelay {
-            id: device_id.clone(), uuid: relay_uuid,
+            id: device_id.clone(),
+            uuid: relay_uuid,
             licence_key: licence_key.clone(),
-            conn_type: ConnType::TERMINAL.into(), ..Default::default()
+            conn_type: ConnType::TERMINAL.into(),
+            ..Default::default()
         });
         send_msg(&mut c, &msg_out, "request_relay").await?;
         c
@@ -1240,21 +1915,27 @@ async fn run(
             .context("Failed to verify peer key from rendezvous")?;
         log::debug!("Peer key vouched: {}", vouched_id);
         Some(sign::PublicKey(pk))
-    } else { None };
+    } else {
+        None
+    };
 
     let msg_in = recv_msg(&mut conn, "wait_signed_id").await?;
     let signed_id = match msg_in.union {
         Some(message::Union::SignedId(si)) => si,
         other => bail!("Expected SignedId, got: {:?}", other.map(|_| "other")),
     };
-    let peer_sign_pk = peer_sign_pk
-        .ok_or_else(|| anyhow::anyhow!("No peer public key from rendezvous server"))?;
+    let peer_sign_pk =
+        peer_sign_pk.ok_or_else(|| anyhow::anyhow!("No peer public key from rendezvous server"))?;
     let (peer_id, their_pk) = decode_id_pk(&signed_id.id, &peer_sign_pk)?;
     log::info!("Peer identity verified: {}", peer_id);
 
     let (av, sv, enc_key) = create_symmetric_key_msg(their_pk);
     let mut pk_msg = Message::new();
-    pk_msg.set_public_key(PublicKey { asymmetric_value: av.into(), symmetric_value: sv.into(), ..Default::default() });
+    pk_msg.set_public_key(PublicKey {
+        asymmetric_value: av.into(),
+        symmetric_value: sv.into(),
+        ..Default::default()
+    });
     send_msg(&mut conn, &pk_msg, "public_key").await?;
     conn.set_key(enc_key);
     log::info!("End-to-end encryption established");
@@ -1266,28 +1947,32 @@ async fn run(
         _ => bail!("Expected Hash challenge"),
     };
     let mut h1 = Sha256::new();
-    h1.update(password.as_bytes()); h1.update(hash.salt.as_bytes());
+    h1.update(password.as_bytes());
+    h1.update(hash.salt.as_bytes());
     let mut h2 = Sha256::new();
-    h2.update(&h1.finalize()[..]); h2.update(hash.challenge.as_bytes());
+    h2.update(&h1.finalize()[..]);
+    h2.update(hash.challenge.as_bytes());
     let pw_response: Vec<u8> = h2.finalize()[..].into();
 
     // Phase 5: Login with Terminal
     let mut lr = LoginRequest::new();
-    lr.username = device_id.clone(); lr.password = pw_response.into();
+    lr.username = device_id.clone();
+    lr.password = pw_response.into();
     lr.my_id = format!("RustShell-{}", std::process::id());
     lr.version = VERSION.to_owned();
     lr.my_platform = std::env::consts::OS.to_owned();
-    // Without this the remote tears the whole service down as soon as we
-    // disconnect (`if !is_persistent { remove_service() }`), so there is nothing
-    // left to reattach to and no buffered output to replay. rustshell never sent
-    // an OptionMessage at all, which is why sessions never survived.
+    // Keep the service persistent even for ordinary sessions. RustDesk 1.4.6
+    // removes non-persistent services synchronously on disconnect while holding
+    // its global terminal registry lock. If Windows helper teardown blocks,
+    // every later terminal Open hangs until the RustDesk service is restarted.
+    // Normal Ctrl+Q still sends CloseTerminal; persistence only makes abnormal
+    // disconnects recoverable instead of poisoning the whole terminal service.
     let mut opt = OptionMessage::new();
     opt.terminal_persistent = option_message::BoolOption::Yes.into();
     lr.option = protobuf::MessageField::some(opt);
 
     let mut terminal = Terminal::new();
-    // Reattach to the persistent session so the remote replays its buffered
-    // output; the caller owns this id so it survives reconnects.
+    // The stable ID isolates slots and lets a disconnected session reattach.
     terminal.service_id = service_id;
     lr.set_terminal(terminal);
     let mut lr_msg = Message::new();
@@ -1296,7 +1981,11 @@ async fn run(
     log::info!("Login request sent");
 
     let bytes = recv_raw(&mut conn, "wait_login_response").await?;
-    log::debug!("Login response raw bytes ({}): {:02x?}", bytes.len(), bytes.as_ref());
+    log::debug!(
+        "Login response raw bytes ({}): {:02x?}",
+        bytes.len(),
+        bytes.as_ref()
+    );
     // Some server versions send LoginResponse directly (not wrapped in Message).
     // Try Message first, then fall back to raw LoginResponse.
     let lr = match Message::parse_from_bytes(&bytes) {
@@ -1312,19 +2001,37 @@ async fn run(
     };
     let mut remote_platform = String::new();
     match lr.union {
-        Some(login_response::Union::Error(err)) if !err.is_empty() => bail!("Login failed: {}", err),
+        Some(login_response::Union::Error(err)) if !err.is_empty() => {
+            bail!("Login failed: {}", err)
+        }
         Some(login_response::Union::PeerInfo(pi)) => {
-            log::info!("Connected to {} ({} {})", pi.hostname, pi.platform, pi.version);
+            log::info!(
+                "Connected to {} ({} {})",
+                pi.hostname,
+                pi.platform,
+                pi.version
+            );
             remote_platform = pi.platform;
         }
         _ => {
             log::debug!("Login accepted (no peer info, empty response)");
-            log::warn!("Server did not provide platform info — terminal access may be unsupported on this host");
+            log::info!("Login accepted (peer omitted optional platform metadata)");
         }
     }
 
     // Phase 6: Terminal I/O
-    terminal_io_loop(conn, &remote_platform, quit_key, render, new_session, slot, log_path, detach).await
+    terminal_io_loop(
+        conn,
+        &remote_platform,
+        quit_key,
+        render,
+        fresh_open,
+        slot,
+        log_path,
+        detach,
+        input_events,
+    )
+    .await
 }
 
 // ── secure_tcp ─────────────────────────────────────────────────────
@@ -1332,34 +2039,62 @@ async fn run(
 async fn attempt_secure_tcp(conn: &mut Link, key: &str) -> Result<()> {
     let rs_pk = match get_rs_pk(key) {
         Some(pk) => pk,
-        None => { log::debug!("No valid key, skipping secure_tcp"); return Ok(()); }
+        None => {
+            log::debug!("No valid key, skipping secure_tcp");
+            return Ok(());
+        }
     };
     match timeout(3000, conn.next()).await {
         Ok(Some(Ok(bytes))) => {
             let rmsg = match RendezvousMessage::parse_from_bytes(&bytes) {
-                Ok(m) => m, Err(_) => { log::debug!("Non-protobuf, skipping"); return Ok(()); }
+                Ok(m) => m,
+                Err(_) => {
+                    log::debug!("Non-protobuf, skipping");
+                    return Ok(());
+                }
             };
             let ex = match rmsg.union {
                 Some(rendezvous_message::Union::KeyExchange(ex)) => ex,
-                _ => { log::debug!("No KeyExchange, proceeding"); return Ok(()); }
+                _ => {
+                    log::debug!("No KeyExchange, proceeding");
+                    return Ok(());
+                }
             };
-            if ex.keys.len() != 1 { log::warn!("Invalid KeyExchange"); return Ok(()); }
+            if ex.keys.len() != 1 {
+                log::warn!("Invalid KeyExchange");
+                return Ok(());
+            }
             let their_pk_b = match sign::verify(&ex.keys[0], &rs_pk) {
-                Ok(pk) => pk, Err(_) => { log::warn!("Sig verify failed"); return Ok(()); }
+                Ok(pk) => pk,
+                Err(_) => {
+                    log::warn!("Sig verify failed");
+                    return Ok(());
+                }
             };
             let their_pk = match get_pk(&their_pk_b) {
-                Some(pk) => pk, None => { log::warn!("Invalid pk len"); return Ok(()); }
+                Some(pk) => pk,
+                None => {
+                    log::warn!("Invalid pk len");
+                    return Ok(());
+                }
             };
             let (av, sv, enc) = create_symmetric_key_msg(their_pk);
             let mut mo = RendezvousMessage::new();
-            mo.set_key_exchange(KeyExchange { keys: vec![av.into(), sv.into()], ..Default::default() });
+            mo.set_key_exchange(KeyExchange {
+                keys: vec![av.into(), sv.into()],
+                ..Default::default()
+            });
             send_msg(conn, &mo, "key_exchange_response").await?;
             conn.set_key(enc);
             log::info!("Secure channel with rendezvous server");
         }
-        Ok(Some(Err(e))) => { log::warn!("Stream err: {e}"); }
+        Ok(Some(Err(e))) => {
+            log::warn!("Stream err: {e}");
+        }
         Ok(None) => bail!("Rendezvous server closed connection"),
-        Err(_) => { log::debug!("No KeyExchange (timeout), proceeding"); }
+        Err(_) => {
+            log::debug!("No KeyExchange (timeout), proceeding");
+        }
     }
     Ok(())
 }
@@ -1403,7 +2138,10 @@ impl SessionLog {
             .append(true)
             .open(path)
             .with_context(|| format!("Failed to open log file {}", path.display()))?;
-        Ok(Self { file, state: EscState::Normal })
+        Ok(Self {
+            file,
+            state: EscState::Normal,
+        })
     }
 
     /// Append `data` with escape sequences removed.
@@ -1461,7 +2199,11 @@ fn strip_escapes(state: &mut EscState, data: &[u8]) -> Vec<u8> {
                 _ => {}
             },
             EscState::OscEsc => {
-                *state = if b == b'\\' { EscState::Normal } else { EscState::Osc };
+                *state = if b == b'\\' {
+                    EscState::Normal
+                } else {
+                    EscState::Osc
+                };
             }
             EscState::SkipOne => *state = EscState::Normal,
         }
@@ -1510,6 +2252,12 @@ mod render_tests {
         // These exercise the renderer, which is off by default.
         s.passthrough = false;
         s
+    }
+
+    #[test]
+    fn zero_sized_screen_does_not_panic() {
+        let s = Screen::new(0, 0);
+        assert_eq!((s.cols, s.rows), (2, 2));
     }
 
     #[test]
@@ -1669,7 +2417,8 @@ mod render_tests {
 
         // Whatever the terminal actually did with the old contents, it is not
         // what our host model thinks.
-        s.host.process(b"\x1b[H\x1b[2Jreflowed differently by the terminal");
+        s.host
+            .process(b"\x1b[H\x1b[2Jreflowed differently by the terminal");
         assert_ne!(
             s.model.screen().contents(),
             s.host.screen().contents(),
@@ -1748,7 +2497,11 @@ mod render_tests {
         let refs: Vec<&str> = second.iter().map(|x| x.as_str()).collect();
         s.feed(&repaint_rows(&refs));
 
-        assert_eq!(s.history_len(), before + 3, "scroll by repaint not detected");
+        assert_eq!(
+            s.history_len(),
+            before + 3,
+            "scroll by repaint not detected"
+        );
         let archived: Vec<String> = s
             .history
             .iter()
@@ -1851,7 +2604,11 @@ mod render_tests {
             let refs: Vec<&str> = rows.iter().map(|x| x.as_str()).collect();
             s.feed(&repaint_rows(&refs));
         }
-        assert!(s.history_len() >= 10, "archive too small: {}", s.history_len());
+        assert!(
+            s.history_len() >= 10,
+            "archive too small: {}",
+            s.history_len()
+        );
         assert!(s.page(1), "should page back into the archive");
         assert!(s.active());
         s.to_live();
@@ -1924,7 +2681,10 @@ mod render_tests {
         let prev = tui_screen(1);
         let cur = tui_screen(4);
         assert_eq!(prev.len(), cur.len());
-        assert!(prev[..6].iter().all(|r| r.trim().is_empty()), "top must be blank");
+        assert!(
+            prev[..6].iter().all(|r| r.trim().is_empty()),
+            "top must be blank"
+        );
         assert_eq!(detect_scroll(&prev, &cur), 3);
     }
 
@@ -1997,12 +2757,18 @@ mod render_tests {
             s.feed(&repaint_rows(&refs));
         }
         let during_alt = s.history_len();
-        assert!(during_alt > before_alt, "alt screen output was not archived");
+        assert!(
+            during_alt > before_alt,
+            "alt screen output was not archived"
+        );
 
         s.feed(&leave_alt());
         assert_in_sync(&s, "left");
         // Nothing archived may be lost by crossing back.
-        assert!(s.history_len() >= during_alt, "archive shrank on leaving the alternate screen");
+        assert!(
+            s.history_len() >= during_alt,
+            "archive shrank on leaving the alternate screen"
+        );
         // 也不能凭空多出来。见下面那条专门的测试。
         assert!(
             s.history_len() <= during_alt + s.rows as usize,
@@ -2037,7 +2803,10 @@ mod render_tests {
             s.feed(&line(&format!("shell{i}")));
         }
         let main_history = s.history_len();
-        assert!(main_history >= 40, "主屏历史太少，测不出问题: {main_history}");
+        assert!(
+            main_history >= 40,
+            "主屏历史太少，测不出问题: {main_history}"
+        );
 
         s.feed(&enter_alt());
         s.feed(&repaint_rows(&["app row"]));
@@ -2070,9 +2839,36 @@ mod render_tests {
         s.repaint(true);
         assert_in_sync(&s, "forced repaint, alternate screen");
     }
+
+    /// 本地终端反压丢掉一帧之后，屏幕必须能自己爬回来。
+    ///
+    /// 过去只有下一帧远端数据才会触发重画。可是最后一帧被丢掉、远端随即安静下来
+    /// 正是刷屏结束时的常态——屏幕于是永远停在半张画面上，看着像死了，其实链路
+    /// 一直好好的。
+    #[test]
+    fn a_dropped_frame_repaints_without_waiting_for_the_remote() {
+        let mut s = screen();
+        s.feed(&line("before"));
+        assert!(!s.needs_repaint(), "正常一帧不该要求重画");
+
+        // 队列满时 emit/flush 走的就是这条路。
+        s.output_dirty = true;
+        assert!(s.needs_repaint(), "丢过帧就必须自己要求重画");
+
+        // 不喂任何新数据，只重画一次，状态就该恢复。
+        s.render();
+        assert!(!s.needs_repaint(), "重画成功之后不该再挂着脏标记");
+        assert_in_sync(&s, "repaint after a dropped frame");
+    }
+
+    /// 直通模式没有屏幕模型，重画无从谈起，不能让主循环空转在这上面。
+    #[test]
+    fn passthrough_never_asks_for_a_repaint() {
+        let mut s = Screen::new(10, 40);
+        s.output_dirty = true;
+        assert!(!s.needs_repaint());
+    }
 }
-
-
 
 #[cfg(test)]
 mod transcript_tests {
@@ -2175,10 +2971,16 @@ impl TerminalSlot {
             let path = dir.join(format!("{}-{}.lock", service_id, id));
             if claim_lock(&path) {
                 log::debug!("Claimed terminal slot {} ({})", id, path.display());
-                return Self { id, lock: Some(path) };
+                return Self {
+                    id,
+                    lock: Some(path),
+                };
             }
         }
-        log::warn!("All {} terminal slots busy; falling back to slot 0", MAX_SLOTS);
+        log::warn!(
+            "All {} terminal slots busy; falling back to slot 0",
+            MAX_SLOTS
+        );
         Self { id: 0, lock: None }
     }
 
@@ -2208,7 +3010,11 @@ fn lock_dir() -> Option<std::path::PathBuf> {
 /// True if we now own `path`. Takes over a lock whose holder stopped
 /// refreshing it (crash, kill -9) rather than leaking the slot forever.
 fn claim_lock(path: &std::path::Path) -> bool {
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
         Ok(mut f) => {
             let _ = f.write_all(std::process::id().to_string().as_bytes());
             true
@@ -2295,51 +3101,170 @@ async fn writer_loop(mut writer: LinkWriter, mut rx: tokio::sync::mpsc::Receiver
 /// `CloseTerminal` 就没了——远端会留下一具「shell 已死、服务端仍登记着」的空
 /// 壳会话,下次不带 -n 重连正好接回它,拿到的是上次退出前那一屏,之后再无输出,
 /// 看起来就是卡死在上次 exit 的地方。
-async fn drain_writer(tx: tokio::sync::mpsc::Sender<Message>, task: tokio::task::JoinHandle<()>) {
+async fn drain_writer(
+    tx: tokio::sync::mpsc::Sender<Message>,
+    mut task: tokio::task::JoinHandle<()>,
+) {
     // 关掉发送端，写任务收完队列里剩下的就会自己结束。
     drop(tx);
-    if timeout(3_000, task).await.is_err() {
-        log::debug!("writer did not drain in time");
+    if timeout(500, &mut task).await.is_err() {
+        // CloseTerminal 很小，正常只需进入本地 TCP 缓冲。半秒仍写不动说明链路
+        // 已经失效；明确 abort，不能让一个脱离管理的 writer 拖住运行时退出。
+        log::debug!("writer did not drain in time; aborting it");
+        task.abort();
+        // abort 只在下一个 await 点生效。写任务若正卡在一段不让出的同步代码里
+        // （加密一条大消息就是），这一等就是无限期的——退出路径上不能有任何
+        // 一步没有上限。
+        if timeout(500, task).await.is_err() {
+            log::debug!("writer did not react to abort; leaving it to runtime shutdown");
+        }
     }
 }
 
+/// Ask RustDesk to tear down the peer connection before dropping our TCP
+/// halves. Without this message the 1.4.6 Windows server accumulates relay
+/// sockets in CLOSE_WAIT and eventually stops servicing terminal requests.
+fn close_connection_message() -> Message {
+    let mut misc = Misc::new();
+    misc.set_close_reason(String::new());
+    let mut msg = Message::new();
+    msg.set_misc(misc);
+    msg
+}
+
+/// Build a protocol-level liveness probe. RustDesk ignores empty protobuf
+/// messages, so a zero-field `Message` does not keep the terminal service
+/// alive and gives us no way to tell a wedged peer from a quiet shell.
+fn keepalive_message(nonce: i64) -> Message {
+    let mut delay = TestDelay::new();
+    delay.time = nonce;
+    delay.from_client = true;
+    let mut msg = Message::new();
+    msg.set_test_delay(delay);
+    msg
+}
+
+fn echo_test_delay(delay: TestDelay) -> Message {
+    let mut msg = Message::new();
+    msg.set_test_delay(delay);
+    msg
+}
+
+async fn finish_connection(
+    tx: tokio::sync::mpsc::Sender<Message>,
+    writer_task: tokio::task::JoinHandle<()>,
+) {
+    stall::enter(stall::CLOSING);
+    tx.try_send(close_connection_message()).ok();
+    drain_writer(tx, writer_task).await;
+}
+
+fn open_terminal_message(terminal_id: i32, rows: u16, cols: u16) -> Message {
+    let mut action = TerminalAction::new();
+    action.set_open(OpenTerminal {
+        terminal_id,
+        rows: rows as u32,
+        cols: cols as u32,
+        ..Default::default()
+    });
+    let mut msg = Message::new();
+    msg.set_terminal_action(action);
+    msg
+}
+
+fn close_terminal_message(terminal_id: i32) -> Message {
+    let mut action = TerminalAction::new();
+    action.set_close(CloseTerminal {
+        terminal_id,
+        ..Default::default()
+    });
+    let mut msg = Message::new();
+    msg.set_terminal_action(action);
+    msg
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = hangup.recv() => {}
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
 async fn terminal_io_loop(
-    mut conn: Link, remote_platform: &str, quit_key: char, render: bool, new_session: bool,
-    slot: &TerminalSlot, log_path: Option<std::path::PathBuf>, detach: bool,
+    mut conn: Link,
+    remote_platform: &str,
+    quit_key: char,
+    render: bool,
+    fresh_open: bool,
+    slot: &TerminalSlot,
+    log_path: Option<std::path::PathBuf>,
+    detach: bool,
+    input_events: &mut tokio::sync::mpsc::UnboundedReceiver<InputResult>,
 ) -> Result<SessionEnd> {
     let mut session_log = match log_path {
         Some(p) => match SessionLog::create(&p) {
-            Ok(l) => { log::info!("Session transcript: {}", p.display()); Some(l) }
+            Ok(l) => {
+                log::info!("Session transcript: {}", p.display());
+                Some(l)
+            }
             // Losing the transcript is not worth refusing the connection over.
-            Err(e) => { log::warn!("Session transcript disabled: {:#}", e); None }
+            Err(e) => {
+                log::warn!("Session transcript disabled: {:#}", e);
+                None
+            }
         },
         None => None,
     };
-    let _guard = ConsoleGuard::enable()?;
     let (cols, rows) = crossterm::terminal::size().context("Failed to get terminal size")?;
+    let (cols, rows) = normalize_terminal_size(cols, rows);
     // Isolation comes from the per-slot service_id, so every session uses the
     // service's default terminal.
     let terminal_id: i32 = 0;
 
-    {
-        let mut action = TerminalAction::new();
-        action.set_open(OpenTerminal { terminal_id, rows: rows as u32, cols: cols as u32, ..Default::default() });
-        let mut msg = Message::new();
-        msg.set_terminal_action(action);
-        send_msg(&mut conn, &msg, "open_terminal").await?;
-    }
-    log::debug!("OpenTerminal sent ({}x{}), waiting for shell...", cols, rows);
+    timeout(
+        3_000,
+        conn.send(&open_terminal_message(terminal_id, rows, cols)),
+    )
+    .await
+    .context("timeout sending terminal open")??;
+    log::debug!(
+        "OpenTerminal sent ({}x{}), waiting for shell...",
+        cols,
+        rows
+    );
 
-    // 握手是一问一答，整条 Link 用着正好；从这里开始两个方向各走各的。
     let (mut reader, writer) = conn.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<Message>(OUTBOUND_QUEUE);
     let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     let mut screen = Screen::new(rows, cols);
     screen.passthrough = !render;
+    let mut pending_input = std::collections::VecDeque::<Input>::new();
     let mut input_timer = time::interval(std::time::Duration::from_millis(20));
-    let mut keepalive = time::interval(std::time::Duration::from_secs(15));
+    let mut keepalive = time::interval(std::time::Duration::from_secs(5));
+    keepalive.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut keepalive_nonce = 0_i64;
+    let mut pending_keepalive: Option<(i64, time::Instant)> = None;
+    let open_timeout = time::sleep(std::time::Duration::from_secs(12));
+    tokio::pin!(open_timeout);
     let mut terminal_opened = false;
+    let mut quitting = false;
+    let close_timeout = time::sleep(std::time::Duration::from_secs(86_400));
+    tokio::pin!(close_timeout);
     let mut locale_injected = false;
     let mut expect_replay = false;
     let mut first_frame = true;
@@ -2348,12 +3273,21 @@ async fn terminal_io_loop(
     let mut last_data = std::time::Instant::now();
     // 一段静默只提醒一次，否则日志会被刷屏。
     let mut quiet_logged = false;
+    // 最近一次把真实输入送出去的时刻，以及「敲了没回音」最近一次报告的时刻。
+    let mut last_input_at: Option<std::time::Instant> = None;
+    let mut quiet_reported_at: Option<std::time::Instant> = None;
+    // 一直没回音时每隔这么久再记一笔，好让日志的时间戳能画出整段静默。
+    const QUIET_REPEAT: std::time::Duration = std::time::Duration::from_secs(30);
     // 静默这么久就认为一次重绘的分片已经到齐了。
     const SETTLE: std::time::Duration = std::time::Duration::from_millis(12);
     // 但输出不停的时候永远等不到静默，所以再给一个强制上限，否则屏幕会冻住。
     const MAX_HOLD: std::time::Duration = std::time::Duration::from_millis(60);
     let mut last_cols = cols;
     let mut last_rows = rows;
+    // 待处理的新尺寸。终端事件和兜底轮询都往这里放，主循环只认最后一个。
+    let mut resize_target: Option<(u16, u16)> = None;
+    let mut last_size_poll = std::time::Instant::now();
+    let mut last_repaint_try = std::time::Instant::now();
 
     /// 把消息交给写任务。
     ///
@@ -2371,27 +3305,100 @@ async fn terminal_io_loop(
     }
 
     loop {
+        // 这里之后就是等事件了。看门狗据此把「正常空闲」和「卡在某个调用里」
+        // 分开——相位停在这里不算卡，停在别处才算。
+        stall::enter(stall::IDLE);
         tokio::select! {
-            _ = keepalive.tick() => {
+            // 本地控制必须先于持续就绪的远端输出。尤其在远端刷屏时，随机公平
+            // 仍可能让 reader 连续获胜；一旦已有本地输入则完全暂停 reader，
+            // 强制下一次 20ms tick 先发送按键或处理 Ctrl+Q。
+            biased;
+
+            _ = &mut open_timeout, if !terminal_opened => {
+                log::error!("Remote terminal did not open within 12 seconds");
+                finish_connection(tx, writer_task).await;
+                bail!("Timed out waiting for the remote shell; the target RustDesk terminal service may be stuck");
+            }
+
+            _ = &mut close_timeout, if quitting => {
+                log::debug!("Remote did not confirm terminal close within 2 seconds");
+                finish_connection(tx, writer_task).await;
+                return Ok(SessionEnd::UserQuit);
+            }
+
+            event = input_events.recv(), if !quitting => {
+                match event {
+                    Some(Ok(input)) => pending_input.push_back(input),
+                    Some(Err(e)) => {
+                        log::info!("Local input stream failed: {e}");
+                        if detach {
+                            finish_connection(tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
+                        }
+                        tx.try_send(close_terminal_message(terminal_id)).ok();
+                        quitting = true;
+                        close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                    }
+                    None => {
+                        log::info!("Local input stream closed");
+                        if detach {
+                            finish_connection(tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
+                        }
+                        tx.try_send(close_terminal_message(terminal_id)).ok();
+                        quitting = true;
+                        close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                    }
+                }
+            }
+
+            signal = &mut shutdown, if !quitting => {
+                signal.context("Failed to register shutdown signals")?;
+                if detach {
+                    log::info!("Process signal received; detaching from remote terminal");
+                    finish_connection(tx, writer_task).await;
+                    return Ok(SessionEnd::UserQuit);
+                } else {
+                    log::info!("Process signal received; closing remote terminal");
+                    // 即使 Opened 尚未返回也要排队关闭；TCP 顺序保证服务端先 Open 再 Close。
+                    tx.try_send(close_terminal_message(terminal_id)).ok();
+                    quitting = true;
+                    close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                }
+            }
+
+            _ = keepalive.tick(), if !quitting => {
                 if terminal_opened {
-                    // Relays and NATs drop idle TCP connections, which is what
-                    // made sessions die on their own. Keep the link warm and
-                    // treat a failed send as the link being gone, rather than
-                    // silently ignoring it and waiting forever for data.
-                    send_out!(Message::new());
+                    if let Some((nonce, sent_at)) = pending_keepalive {
+                        if sent_at.elapsed() >= std::time::Duration::from_secs(15) {
+                            log::warn!("RustDesk liveness probe {nonce} was not acknowledged within 15 seconds");
+                            finish_connection(tx, writer_task).await;
+                            return Ok(SessionEnd::Disconnected);
+                        }
+                    } else {
+                        keepalive_nonce = keepalive_nonce.wrapping_add(1);
+                        send_out!(keepalive_message(keepalive_nonce));
+                        pending_keepalive = Some((keepalive_nonce, time::Instant::now()));
+                    }
                     // Prove to other local instances that this slot is still ours.
                     slot.refresh();
                 }
             }
 
-            res = reader.next() => {
+            res = reader.next(), if pending_input.is_empty() || quitting => {
                 let bytes = match res {
                     Some(Ok(b)) => b,
                     // Both mean the transport died, not that the remote shell
                     // exited — the session on the far side is probably still
                     // there, so this is reconnectable.
-                    Some(Err(e)) => { log::info!("Stream error: {}", e); return Ok(SessionEnd::Disconnected); }
-                    None => { log::info!("Connection closed by peer"); return Ok(SessionEnd::Disconnected); }
+                    Some(Err(e)) => {
+                        log::info!("Stream error: {}", e);
+                        return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
+                    }
+                    None => {
+                        log::info!("Connection closed by peer");
+                        return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
+                    }
                 };
                 let msg_in = match Message::parse_from_bytes(&bytes) {
                     Ok(m) => m, Err(e) => { log::error!("Parse: {} (raw: {:02x?})", e, bytes.as_ref()); continue; }
@@ -2469,10 +3476,11 @@ async fn terminal_io_loop(
                                 // 全新会话（-n）不能这么做——那一帧是 shell 的
                                 // 初始输出，丢了就真没了。
                                 let treat_as_replay = expect_replay
-                                    || (first_frame && (!new_session || screen.renders()));
+                                    || (first_frame && (!fresh_open || screen.renders()));
                                 if treat_as_replay {
                                     expect_replay = false;
                                     first_frame = false;
+                                    stall::enter(stall::REPLAY);
                                     if screen.feed_replay(&output) {
                                         // Ctrl+L 是「重画」的通用约定，shell
                                         // 和全屏应用都认。比发回车安全——回车
@@ -2493,6 +3501,7 @@ async fn terminal_io_loop(
                                     // 只吸收，不画。画的时机由下面的定时器在
                                     // 字节流静下来之后决定——半张重绘不能拿去
                                     // 做滚动检测。
+                                    stall::enter(stall::ABSORB);
                                     screen.absorb(&output);
                                     last_data = std::time::Instant::now();
                                     quiet_logged = false;
@@ -2502,25 +3511,36 @@ async fn terminal_io_loop(
                             }
                             Some(Union::Closed(c)) => {
                                 log::info!("Terminal closed (exit code: {})", c.exit_code);
+                                if quitting {
+                                    finish_connection(tx, writer_task).await;
+                                    return Ok(SessionEnd::UserQuit);
+                                }
                                 // shell 自己退出了也要告诉服务端销毁这个会话。
                                 //
-                                // 会话是持久的（terminal_persistent），只收到 Closed 就
-                                // 走人的话，远端会留下一具「shell 已死、服务端仍登记着」
-                                // 的空壳。下次不带 -n 重连正好接回它，拿到的是上次退出前
-                                // 那一屏回放，之后再没有任何输出——看起来就是卡死在上次
-                                // exit 的地方。
+                                // Explicitly close the terminal record as well.
+                                // This removes the persistent terminal record as
+                                // well as the process that already exited.
                                 if terminal_opened {
-                                    let mut a = TerminalAction::new();
-                                    a.set_close(CloseTerminal { terminal_id, ..Default::default() });
-                                    let mut m = Message::new();
-                                    m.set_terminal_action(a);
-                                    tx.try_send(m).ok();
+                                    tx.try_send(close_terminal_message(terminal_id)).ok();
                                 }
-                                drain_writer(tx, writer_task).await;
+                                finish_connection(tx, writer_task).await;
                                 return Ok(SessionEnd::RemoteClosed);
                             }
                             Some(Union::Error(e)) => bail!("Terminal error: {}", e.message),
                             _ => { log::debug!("TerminalResponse with empty union"); }
+                        }
+                    }
+                    Some(message::Union::TestDelay(delay)) => {
+                        if delay.from_client {
+                            if matches!(pending_keepalive, Some((nonce, _)) if nonce == delay.time) {
+                                pending_keepalive = None;
+                            }
+                        } else {
+                            // RustDesk sends this connection-level probe once and
+                            // waits for the same message before scheduling another.
+                            // Failing to echo it leaves an idle terminal connection
+                            // in a permanently half-probed state.
+                            send_out!(echo_test_delay(delay));
                         }
                     }
                     Some(message::Union::Hash(_)) => {}
@@ -2528,23 +3548,35 @@ async fn terminal_io_loop(
                 }
             }
 
-            _ = input_timer.tick() => {
+            _ = input_timer.tick(), if !quitting => {
                 // 写任务死了就等于链路断了。靠下一次发送去发现的话，空闲时要
                 // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
                 if writer_task.is_finished() {
                     log::info!("Writer task ended, connection lost");
-                    return Ok(SessionEnd::Disconnected);
+                    return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                 }
 
                 if let Some(since) = pending_since {
                     if last_data.elapsed() >= SETTLE || since.elapsed() >= MAX_HOLD {
                         let started = std::time::Instant::now();
+                        stall::enter(stall::FLUSH);
                         screen.flush();
                         if started.elapsed() >= SLOW_FLUSH {
                             log::debug!("flush took {:?}", started.elapsed());
                         }
                         pending_since = None;
                     }
+                }
+
+                // 丢过帧就一直重试整屏重画，直到本地终端喘过气来。间隔放宽到
+                // 200 毫秒：队列还满着的时候每 20 毫秒重造一屏纯属白烧 CPU，
+                // 而且只会让本来就堵着的队列更堵。
+                if screen.needs_repaint()
+                    && last_repaint_try.elapsed() >= std::time::Duration::from_millis(200)
+                {
+                    last_repaint_try = std::time::Instant::now();
+                    stall::enter(stall::REPAINT);
+                    screen.render();
                 }
 
                 // 卡死时日志的最后一行要能指认是哪一环:收不到帧了(远端或链路
@@ -2554,9 +3586,57 @@ async fn terminal_io_loop(
                     log::debug!("no frame received for {:?}", last_data.elapsed());
                 }
 
-                if let Ok((nc, nr)) = crossterm::terminal::size() {
+                // 「敲了却一个字节都不回来」是个和空闲截然不同的状态。
+                //
+                // 单纯的「远端很久没输出」不能报——停在提示符上的 shell 本来就
+                // 该是安静的。但我们刚发过输入、之后一个字节都没回来，那就只有
+                // 两种可能：远端的终端服务不动了，或者链路只是看着还活着。这两
+                // 者都不是本地渲染的锅，日志必须把这句话说出来，否则下次又要从
+                // 头猜一遍。
+                if terminal_opened {
+                    if let Some(sent) = last_input_at {
+                        // 写成 match 而不是 is_none_or：后者要 Rust 1.82，
+                        // 而 Cargo.toml 声明的 MSRV 是 1.75。
+                        let due = match quiet_reported_at {
+                            None => true,
+                            Some(t) => t.elapsed() >= QUIET_REPEAT,
+                        };
+                        if sent > last_data && sent.elapsed() >= QUIET_WARN && due {
+                            quiet_reported_at = Some(std::time::Instant::now());
+                            log::warn!(
+                                "已向远端发送输入 {:?}，期间没有收到任何输出；保活{}。这段静默在远端或链路，不是本地渲染。",
+                                sent.elapsed(),
+                                if pending_keepalive.is_some() {
+                                    "未收到回包"
+                                } else {
+                                    "正常"
+                                }
+                            );
+                        }
+                    }
+                }
+
+                // 尺寸以终端送来的 Resize 事件为准。轮询只作兜底，两秒一次——
+                // 万一某个终端不报事件，功能仍在，但不再是刷屏时的锁竞争来源。
+                if resize_target.is_none()
+                    && last_size_poll.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    last_size_poll = std::time::Instant::now();
+                    stall::enter(stall::SIZE_QUERY);
+                    if let Ok((nc, nr)) = crossterm::terminal::size() {
+                        if (nc, nr) != (last_cols, last_rows) {
+                            resize_target = Some((nc, nr));
+                        }
+                    }
+                }
+
+                // 拖拽窗口会连着报很多次尺寸。逐次处理等于逐次整屏重画，
+                // 这里只认最后一个。
+                if let Some((nc, nr)) = resize_target.take() {
+                    let (nc, nr) = normalize_terminal_size(nc, nr);
                     if (nc != last_cols || nr != last_rows) && terminal_opened {
                         log::debug!("Resize: {}x{}", nc, nr);
+                        stall::enter(stall::REPAINT);
                         let ask_redraw = screen.resize(nr, nc);
                         let mut a = TerminalAction::new();
                         a.set_resize(ResizeTerminal { terminal_id, rows: nr as u32, cols: nc as u32, ..Default::default() });
@@ -2578,9 +3658,11 @@ async fn terminal_io_loop(
                     }
                 }
                 let mut typed: Vec<u8> = Vec::new();
-                while let Some(input) = poll_input() {
+                stall::enter(stall::INPUT);
+                while let Some(input) = pending_input.pop_front() {
                     let ev = match input {
                         Input::Key(k) => k,
+                        Input::Resize(c, r) => { resize_target = Some((c, r)); continue; }
                         Input::Paste(text) => {
                             if !terminal_opened { continue; }
                             if screen.active() { screen.to_live(); screen.render(); }
@@ -2598,6 +3680,8 @@ async fn terminal_io_loop(
                             let mut a = TerminalAction::new();
                             a.set_data(TerminalData { terminal_id, data: payload.into(), compressed: false, ..Default::default() });
                             let mut m = Message::new(); m.set_terminal_action(a);
+                            log::debug!("Input: queueing {} pasted bytes", body.len());
+                            last_input_at = Some(std::time::Instant::now());
                             send_out!(m);
                             continue;
                         }
@@ -2642,10 +3726,15 @@ async fn terminal_io_loop(
                     {
                         // 诊断用：让 Ctrl+V 走合成图，把「会话进行中发送」这个
                         // 变量单独隔离出来测。
+                        // arboard 读剪贴板是阻塞的 Win32 调用，别的进程占着剪贴板
+                        // 时它要等。卡在这里的话网络读和保活会一起停，所以单独标
+                        // 一个相位，好把它和渲染卡死区分开。
+                        stall::enter(stall::CLIPBOARD);
                         let built = match std::env::var("RUSTSHELL_CLIP_TEST") {
                             Ok(spec) => synthetic_clipboard_image(&spec),
                             Err(_) => clipboard_image_message(),
                         };
+                        stall::enter(stall::INPUT);
                         match built {
                             Ok((m, bytes, w, h)) => {
                                 log::debug!("clipboard image {w}x{h}, {bytes} bytes compressed");
@@ -2660,7 +3749,9 @@ async fn terminal_io_loop(
                                     // The remote applies the clipboard on its own
                                     // thread, so the keystroke has to lag behind
                                     // it or the app reads the old clipboard.
+                                    stall::enter(stall::CLIP_WAIT);
                                     time::sleep(std::time::Duration::from_millis(200)).await;
+                                    stall::enter(stall::INPUT);
                                 }
                             }
                             // Say so rather than doing nothing. "Ctrl+V did not
@@ -2676,12 +3767,9 @@ async fn terminal_io_loop(
                     if data.is_empty() { continue; }
                     let quit_byte = (quit_key.to_ascii_lowercase() as u8) - b'a' + 1;
                     if data == [quit_byte] {
-                        // Close by default. Detaching leaks on the remote: its
-                        // connection sockets pile up in CLOSE_WAIT and the
-                        // service thread keeps polling, until RustDesk burns a
-                        // core and drops off the rendezvous server entirely
-                        // ("remote device is offline"). An explicit CloseTerminal
-                        // is the path the server cleans up properly.
+                        // Close the shell by default. `--detach` keeps only the
+                        // persistent shell alive; both paths still send the
+                        // connection-level close handshake before dropping TCP.
                         if terminal_opened && !typed.is_empty() {
                             let mut a = TerminalAction::new();
                             a.set_data(TerminalData {
@@ -2696,17 +3784,17 @@ async fn terminal_io_loop(
                         }
                         if detach {
                             log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
+                            finish_connection(tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
                         } else {
                             log::info!("Closing terminal (Ctrl+{})...", quit_key.to_ascii_uppercase());
-                            if terminal_opened {
-                                let mut a = TerminalAction::new();
-                                a.set_close(CloseTerminal { terminal_id, ..Default::default() });
-                                let mut m = Message::new(); m.set_terminal_action(a);
-                                tx.try_send(m).ok();
-                            }
+                            // Opened 尚未返回时也要排队关闭，防止快速关窗留下持久 shell。
+                            tx.try_send(close_terminal_message(terminal_id)).ok();
+                            quitting = true;
+                            close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
                         }
-                        drain_writer(tx, writer_task).await;
-                        return Ok(SessionEnd::UserQuit);
+                        pending_input.clear();
+                        break;
                     }
                     // 攒起来，本轮结束一次发完。一个按键一条消息的话，打字
                     // 快一点就是几十条消息背靠背挤过中继——实测会丢字，表现
@@ -2715,6 +3803,8 @@ async fn terminal_io_loop(
                 }
 
                 if terminal_opened && !typed.is_empty() {
+                    log::debug!("Input: queueing {} typed bytes", typed.len());
+                    last_input_at = Some(std::time::Instant::now());
                     let mut a = TerminalAction::new();
                     a.set_data(TerminalData {
                         terminal_id,
