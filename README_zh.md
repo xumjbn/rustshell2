@@ -37,6 +37,7 @@ rustshell [OPTIONS] --id <ID> --server <SERVER>
   -t, --slot <SLOT>          会话槽位 [默认: 本地第一个空闲槽位]
   -l, --log-file <PATH>      把纯文本会话记录写到此路径（不指定则不写）
       --detach               退出时保留远端 shell 继续运行
+      --no-remote-close      任何退出都不销毁远端会话（远端 helper 卡住时销毁会拖死 RustDesk）
       --no-reconnect         断线后不自动重连
   -d, --debug                启用调试日志
   -h, --help                 打印帮助
@@ -46,15 +47,18 @@ rustshell [OPTIONS] --id <ID> --server <SERVER>
 
 会话始终声明 `terminal_persistent`，异常断线后可以接回。这是在规避 RustDesk 1.4.6 的服务端
 缺陷：非持久连接断开时，它会持有全局终端注册表锁并同步销毁 Windows helper；helper 一旦卡住，
-后续所有 shell 都无法打开。正常按 Ctrl+Q 仍会发送 `CloseTerminal`，并最多等待两秒关闭确认。
-随后所有本地退出路径都会先发送 RustDesk 连接级的 `close_reason` 握手再释放中继 socket；缺少它时，
-1.4.6 Windows 服务端会残留 `CLOSE_WAIT`。`--detach` 只跳过 `CloseTerminal`、保留远端 shell，
-仍会正常关闭对等连接。
+后续所有 shell 都无法打开。所有本地退出路径都会先发送 RustDesk 连接级的 `close_reason` 握手再释放
+中继 socket；缺少它时，1.4.6 Windows 服务端会残留 `CLOSE_WAIT`。
+
+**销毁远端会话（`CloseTerminal`）只在一种情况下发生：用户按 Ctrl+Q，而且链路仍在应答保活探测。**
+同一把全局锁在销毁时也会被持有，helper 正忙（远端刷屏、跑 codex 之类）或已经卡住时，这一发会把
+整个 RustDesk 服务拖死——设备直接显示离线，只能重启 RustDesk 服务才能恢复。因此关掉本地窗口、
+`SIGHUP`/`SIGTERM`、输入流断开这些**被迫退出**一律不再销毁远端会话，只做连接级关闭；保活探测三秒
+没有回执时 Ctrl+Q 也会降级成同样的行为并给出警告。会话是持久的，远端 shell 留着，下次连回同一槽位
+接的还是它。`--no-remote-close` 可以彻底关掉销毁（等价于每次退出都 `--detach`）。
 
 `--new-session` 会直接使用全新的 service ID，不再先关闭旧 service。这是刻意绕开 RustDesk 1.4.6
 的缺陷：它可能永远阻塞在旧 Windows helper 的关闭过程中，导致后续 Open 根本得不到执行。
-在 macOS/Linux 上，关闭本地终端窗口产生的 `SIGHUP` 或 `SIGTERM` 仍会发送 `CloseTerminal`；
-只有显式使用 `--detach` 时才保留远端 shell。
 
 每个并发窗口占用一个**槽位**，一个槽位对应一个独立的远端会话。这一点很关键：远端会把
 某个会话的输出广播给所有连到它的客户端，所以两个窗口共用一个会话就会互相看到对方的输入。
@@ -140,6 +144,7 @@ CLI 参数优先级高于环境变量。
 | `RUSTSHELL_SLOT` | `--slot` | 会话槽位编号 |
 | `RUSTSHELL_LOG_FILE` | `--log-file` | 会话记录路径 |
 | `RUSTSHELL_DETACH` | `--detach` | 设为 `1` 或 `true` |
+| `RUSTSHELL_NO_REMOTE_CLOSE` | `--no-remote-close` | 设为 `1` 或 `true` |
 | `RUSTSHELL_NO_RECONNECT` | `--no-reconnect` | 设为 `1` 或 `true` |
 | `RUSTSHELL_DEBUG` | `--debug` | 设为 `1` 或 `true` |
 

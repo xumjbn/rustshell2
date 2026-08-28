@@ -37,6 +37,7 @@ Options:
   -t, --slot <SLOT>          Session slot [default: first one not in use locally]
   -l, --log-file <PATH>      Write a plain-text transcript here (off unless set)
       --detach               Leave the remote shell running on quit
+      --no-remote-close      Never destroy the remote session, on any exit
       --no-reconnect         Do not reconnect automatically when the link drops
   -d, --debug                Enable debug logging
   -h, --help                 Print help
@@ -47,18 +48,28 @@ Options:
 Sessions advertise `terminal_persistent` so an abrupt disconnect remains
 reattachable. This avoids a RustDesk 1.4.6 bug: its non-persistent disconnect
 path tears down the Windows helper while holding the global terminal registry
-lock, and a stuck helper then prevents every later shell from opening. A normal
-Ctrl+Q still sends `CloseTerminal` and waits up to two seconds for confirmation.
-Every local exit then sends RustDesk's connection-level `close_reason` handshake
-before releasing the relay socket; without it, the 1.4.6 Windows server leaves
-connections in `CLOSE_WAIT`. `--detach` skips only `CloseTerminal`, leaving the
-shell alive while still closing the peer connection cleanly.
+lock, and a stuck helper then prevents every later shell from opening. Every
+local exit sends RustDesk's connection-level `close_reason` handshake before
+releasing the relay socket; without it, the 1.4.6 Windows server leaves
+connections in `CLOSE_WAIT`.
+
+**Destroying the remote session (`CloseTerminal`) happens in exactly one case:
+the user pressed Ctrl+Q and the link is still answering liveness probes.**
+Destruction takes that same global lock, so when the helper is busy (a remote
+that is repainting hard, `codex` and friends) or already stuck, this one message
+wedges the whole RustDesk service — the device goes offline and only a RustDesk
+service restart brings it back. Forced exits — closing the local window,
+`SIGHUP`/`SIGTERM`, a broken input stream — therefore never destroy the remote
+session; they only close the connection. Ctrl+Q degrades to the same behaviour,
+with a warning, when a liveness probe has gone unanswered for three seconds. The
+session is persistent, so the remote shell stays and the next connection to the
+same slot reattaches to it. `--no-remote-close` disables destruction entirely
+(equivalent to `--detach` on every exit).
 
 `--new-session` uses a brand-new service ID instead of closing the previous
 service first. This is deliberate: RustDesk 1.4.6 can block forever while
 closing a stale Windows helper, which would prevent the following Open from
-running. On macOS/Linux, closing the local terminal window sends
-`CloseTerminal` on `SIGHUP` or `SIGTERM` unless `--detach` was requested.
+running.
 
 Each concurrent window takes its own *slot*, and a slot maps to its own remote
 session. This matters: the remote broadcasts a session's output to every client
@@ -168,6 +179,7 @@ CLI arguments take precedence when both are provided.
 | `RUSTSHELL_SLOT` | `--slot` | Session slot number |
 | `RUSTSHELL_LOG_FILE` | `--log-file` | Transcript path |
 | `RUSTSHELL_DETACH` | `--detach` | Set to `1` or `true` |
+| `RUSTSHELL_NO_REMOTE_CLOSE` | `--no-remote-close` | Set to `1` or `true` |
 | `RUSTSHELL_NO_RECONNECT` | `--no-reconnect` | Set to `1` or `true` |
 | `RUSTSHELL_DEBUG` | `--debug` | Set to `1` or `true` |
 

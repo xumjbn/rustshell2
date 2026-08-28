@@ -27,7 +27,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     after_help = "Environment variables (fallback when CLI arg not set):\n  \
                   RUSTSHELL_ID, RUSTSHELL_SERVER, RUSTSHELL_PORT, RUSTSHELL_KEY, \
                   RUSTSHELL_PASSWORD, RUSTSHELL_QUIT_KEY=(a-z), RUSTSHELL_DEBUG=(1|true), \
-                  RUSTSHELL_NEW_SESSION=(1|true), RUSTSHELL_DETACH=(1|true)"
+                  RUSTSHELL_NEW_SESSION=(1|true), RUSTSHELL_DETACH=(1|true), \
+                  RUSTSHELL_NO_REMOTE_CLOSE=(1|true)"
 )]
 struct Args {
     #[arg(short = 'i', long, default_value = "")]
@@ -65,6 +66,9 @@ struct Args {
     /// 读一次本地剪贴板并报告结果，不连接。用于定位 Ctrl+V 不生效是哪一环。
     #[arg(long, default_value = "false")]
     clipboard_check: bool,
+    /// 退出时一律不要求远端销毁会话（远端 helper 卡住时，销毁会拖死整个 RustDesk 服务）
+    #[arg(long, default_value = "false")]
+    no_remote_close: bool,
 }
 
 /// Why a session ended — decides whether reconnecting makes sense.
@@ -254,6 +258,35 @@ mod session_lifecycle_tests {
                 from_client: true,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn a_quiet_link_may_still_be_asked_to_close_the_session() {
+        assert!(may_close_remote(false, None));
+        assert!(may_close_remote(
+            false,
+            Some(std::time::Duration::from_millis(200))
+        ));
+    }
+
+    #[test]
+    fn a_link_that_stopped_answering_probes_is_never_asked_to_close() {
+        // 这一发打在忙/卡住的 Windows helper 上会把整个 RustDesk 服务锁死，
+        // 设备直接离线。宁可把 persistent shell 留在远端。
+        assert!(!may_close_remote(false, Some(PROBE_STALE)));
+        assert!(!may_close_remote(
+            false,
+            Some(std::time::Duration::from_secs(60))
+        ));
+    }
+
+    #[test]
+    fn opting_out_wins_over_a_healthy_link() {
+        assert!(!may_close_remote(true, None));
+        assert!(!may_close_remote(
+            true,
+            Some(std::time::Duration::from_millis(1))
         ));
     }
 
@@ -1596,6 +1629,11 @@ fn main() {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     }
+    if !args.no_remote_close {
+        args.no_remote_close = std::env::var("RUSTSHELL_NO_REMOTE_CLOSE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    }
 
     if args.clipboard_check {
         match clipboard_image_message() {
@@ -1709,6 +1747,7 @@ fn main() {
             args.detach,
             args.render,
             fresh_open,
+            args.no_remote_close,
             &mut input_events,
         ));
         // A reconnect always targets the same persistent service and replays
@@ -1783,6 +1822,7 @@ async fn run(
     detach: bool,
     render: bool,
     fresh_open: bool,
+    no_remote_close: bool,
     input_events: &mut tokio::sync::mpsc::UnboundedReceiver<InputResult>,
 ) -> Result<SessionEnd> {
     let rendezvous_addr = format!("{}:{}", server, port);
@@ -2029,6 +2069,7 @@ async fn run(
         slot,
         log_path,
         detach,
+        no_remote_close,
         input_events,
     )
     .await
@@ -3172,6 +3213,28 @@ fn open_terminal_message(terminal_id: i32, rows: u16, cols: u16) -> Message {
     msg
 }
 
+/// 保活探测超过这么久还没回执，就认为这条链路已经不健康了。
+///
+/// 探测每 5 秒发一次，正常回执在一个 RTT 内。3 秒仍未回来说明远端至少已经腾不出
+/// 手来处理协议消息。
+const PROBE_STALE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// 此刻能不能要求远端销毁这个终端会话。
+///
+/// `CloseTerminal` 在 RustDesk 1.4.6 的 Windows 端会同步停掉 helper，而且是**持着
+/// 全局终端注册表锁**做的。helper 正忙或已经卡住时（远端刷屏、跑 codex 之类），这
+/// 一发会把整个 RustDesk 服务拖死：设备直接显示离线，只能重启 RustDesk 服务才能
+/// 恢复。
+///
+/// 不发的代价小得多：会话本来就声明了 persistent，shell 留在远端，下次同槽位连回
+/// 去接的还是它——槽位的 service_id 是稳定的，所以也不会越积越多。
+fn may_close_remote(opted_out: bool, unacked_probe: Option<std::time::Duration>) -> bool {
+    if opted_out {
+        return false;
+    }
+    !matches!(unacked_probe, Some(waited) if waited >= PROBE_STALE)
+}
+
 fn close_terminal_message(terminal_id: i32) -> Message {
     let mut action = TerminalAction::new();
     action.set_close(CloseTerminal {
@@ -3211,6 +3274,7 @@ async fn terminal_io_loop(
     slot: &TerminalSlot,
     log_path: Option<std::path::PathBuf>,
     detach: bool,
+    no_remote_close: bool,
     input_events: &mut tokio::sync::mpsc::UnboundedReceiver<InputResult>,
 ) -> Result<SessionEnd> {
     let mut session_log = match log_path {
@@ -3329,42 +3393,32 @@ async fn terminal_io_loop(
             event = input_events.recv(), if !quitting => {
                 match event {
                     Some(Ok(input)) => pending_input.push_back(input),
+                    // 本地输入没了（窗口被关掉、终端被回收）不是「用户要求拆会话」，
+                    // 而是「这边出事了」——恰恰是最不该去踩远端那把全局锁的时刻。
+                    // 一律按 detach 处理：只做连接级关闭握手，远端 shell 留着，下次
+                    // 同槽位连回去还是它。
                     Some(Err(e)) => {
-                        log::info!("Local input stream failed: {e}");
-                        if detach {
-                            finish_connection(tx, writer_task).await;
-                            return Ok(SessionEnd::UserQuit);
-                        }
-                        tx.try_send(close_terminal_message(terminal_id)).ok();
-                        quitting = true;
-                        close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                        log::info!("Local input stream failed: {e}; leaving the remote session in place");
+                        finish_connection(tx, writer_task).await;
+                        return Ok(SessionEnd::UserQuit);
                     }
                     None => {
-                        log::info!("Local input stream closed");
-                        if detach {
-                            finish_connection(tx, writer_task).await;
-                            return Ok(SessionEnd::UserQuit);
-                        }
-                        tx.try_send(close_terminal_message(terminal_id)).ok();
-                        quitting = true;
-                        close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                        log::info!("Local input stream closed; leaving the remote session in place");
+                        finish_connection(tx, writer_task).await;
+                        return Ok(SessionEnd::UserQuit);
                     }
                 }
             }
 
             signal = &mut shutdown, if !quitting => {
                 signal.context("Failed to register shutdown signals")?;
-                if detach {
-                    log::info!("Process signal received; detaching from remote terminal");
-                    finish_connection(tx, writer_task).await;
-                    return Ok(SessionEnd::UserQuit);
-                } else {
-                    log::info!("Process signal received; closing remote terminal");
-                    // 即使 Opened 尚未返回也要排队关闭；TCP 顺序保证服务端先 Open 再 Close。
-                    tx.try_send(close_terminal_message(terminal_id)).ok();
-                    quitting = true;
-                    close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
-                }
+                // SIGHUP/SIGTERM 同理：进程被外力终止（关窗口、kill、被卡死之后
+                // 补刀）时不去销毁远端会话。现场那次离线正是走的这条路——客户端
+                // 卡在 codex 的输出里被强退，这一发 CloseTerminal 打到一个正忙的
+                // Windows helper 上，把整个 RustDesk 服务锁死了。
+                log::info!("Process signal received; leaving the remote session in place");
+                finish_connection(tx, writer_task).await;
+                return Ok(SessionEnd::UserQuit);
             }
 
             _ = keepalive.tick(), if !quitting => {
@@ -3515,12 +3569,18 @@ async fn terminal_io_loop(
                                     finish_connection(tx, writer_task).await;
                                     return Ok(SessionEnd::UserQuit);
                                 }
-                                // shell 自己退出了也要告诉服务端销毁这个会话。
+                                // shell 自己退出了，顺手把服务端那条空壳记录也销毁，
+                                // 否则下次不带 -n 重连正好接回它——拿到上次退出前那
+                                // 一屏，之后再无输出。
                                 //
-                                // Explicitly close the terminal record as well.
-                                // This removes the persistent terminal record as
-                                // well as the process that already exited.
-                                if terminal_opened {
+                                // 但同样要过健康检查：远端刚报完 shell 退出不代表它
+                                // 腾得出手做销毁，而销毁是持全局锁同步停 helper 的。
+                                if terminal_opened
+                                    && may_close_remote(
+                                        no_remote_close,
+                                        pending_keepalive.map(|(_, sent_at)| sent_at.elapsed()),
+                                    )
+                                {
                                     tx.try_send(close_terminal_message(terminal_id)).ok();
                                 }
                                 finish_connection(tx, writer_task).await;
@@ -3782,8 +3842,21 @@ async fn terminal_io_loop(
                             m.set_terminal_action(a);
                             tx.try_send(m).ok();
                         }
+                        // 只有这一条路径是用户明确说「拆掉它」，也只有这一条还会
+                        // 发 CloseTerminal——而且要先确认链路还在应答保活。
+                        let may_close = may_close_remote(
+                            no_remote_close,
+                            pending_keepalive.map(|(_, sent_at)| sent_at.elapsed()),
+                        );
                         if detach {
                             log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
+                            finish_connection(tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
+                        } else if !may_close {
+                            log::warn!(
+                                "Quitting without closing the remote terminal: the link is not answering liveness probes. \
+                                 The shell stays on the remote; reconnect to the same slot to get it back."
+                            );
                             finish_connection(tx, writer_task).await;
                             return Ok(SessionEnd::UserQuit);
                         } else {
