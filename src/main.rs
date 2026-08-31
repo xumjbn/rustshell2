@@ -132,6 +132,14 @@ fn fresh_service_id(base: &str, slot: i32) -> String {
     id
 }
 
+/// 远端持久终端已经被旧连接卡住时，OpenTerminal 会一直等不到回应。
+/// 这种错误只能通过换一个 service_id 绕开，不应对同一个坏服务无限重试。
+fn is_terminal_open_timeout(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("Timed out waiting for the remote shell")
+}
+
 /// vt100 和远端 PTY 都不接受 0 尺寸；宽高至少为 2，避免宽字符路径做 `cols - 2`
 /// 时下溢，也避开 vt100 0.15 在单行网格滚屏时的无效行索引。
 fn normalize_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -154,6 +162,15 @@ mod session_lifecycle_tests {
         let fresh = fresh_service_id("ts_base", 7);
         assert_ne!(fresh, stable);
         assert!(fresh.starts_with("ts_bases7n"));
+    }
+
+    #[test]
+    fn terminal_open_timeout_is_detected_for_service_recovery() {
+        let error = anyhow::anyhow!(
+            "Timed out waiting for the remote shell; the target RustDesk terminal service may be stuck"
+        );
+        assert!(is_terminal_open_timeout(&error));
+        assert!(!is_terminal_open_timeout(&anyhow::anyhow!("login failed")));
     }
 
     #[test]
@@ -480,7 +497,7 @@ mod stall {
         "读本地剪贴板(arboard)",
         "剪贴板发送后的固定等待",
         "处理本地按键",
-        "关闭连接：等写任务把 CloseTerminal 冲上线",
+        "关闭连接：等写任务把关闭帧冲上线",
         "退出：恢复本地终端模式",
         "退出：关闭 tokio 运行时",
     ];
@@ -1701,7 +1718,7 @@ fn main() {
     // service_id, so two windows sharing one service_id see each other's shell
     // even with distinct terminal_ids. Isolation has to happen here: one
     // service_id per slot, stable per slot so each window reattaches to its own.
-    let service_id = if args.new_session {
+    let mut service_id = if args.new_session {
         fresh_service_id(&base, slot.id)
     } else {
         slot_service_id(&base, slot.id)
@@ -1719,6 +1736,7 @@ fn main() {
 
     let mut attempt: u32 = 0;
     let mut failed = false;
+    let mut fresh_fallback_used = false;
     let mut fresh_open = args.new_session;
     let _console_guard = match ConsoleGuard::enable() {
         Ok(guard) => guard,
@@ -1734,6 +1752,9 @@ fn main() {
     // 记 info 而不是 debug：不带 -d 的日志也要能一眼看出跑的是带取证的版本。
     log::info!("卡死取证文件: {}", stall::report_path().display());
     loop {
+        // 网络连接和服务端握手期间没有本地阻塞调用，不能沿用上一次收尾时的相位，
+        // 否则重连等待超过三秒会被看门狗误报成卡死在 CloseTerminal。
+        stall::enter(stall::IDLE);
         let outcome = rt.block_on(run(
             args.id.clone(),
             args.key.clone(),
@@ -1754,6 +1775,20 @@ fn main() {
         // its buffered output. Only the first --new-session open is fresh.
         fresh_open = false;
 
+        // 同一个持久 service 被旧连接卡住时，登录仍会成功，但 OpenTerminal 永远
+        // 没有回应。只在第一次遇到这个明确症状时切换新 service，避免后续重连不断
+        // 创建新会话；新 service 后续仍保持稳定，断线可以继续接回。
+        if !fresh_fallback_used
+            && matches!(&outcome, Err(error) if is_terminal_open_timeout(error))
+        {
+            fresh_fallback_used = true;
+            service_id = fresh_service_id(&base, slot.id);
+            fresh_open = true;
+            log::warn!(
+                "持久终端打开超时，将切换到新的 service_id 绕过远端卡住的 terminal service"
+            );
+        }
+
         let should_retry = match &outcome {
             Ok(SessionEnd::UserQuit) => {
                 break;
@@ -1766,7 +1801,9 @@ fn main() {
                 eprintln!("\r\nError: {:#}", e);
                 // A failure before the first successful session is usually a
                 // bad address or password — retrying would just repeat it.
-                attempt > 0
+                // terminal open 超时例外：这通常是旧 persistent service 被卡住，
+                // 上面已经切换了 fresh service_id，必须允许它完成一次恢复重试。
+                attempt > 0 || (fresh_fallback_used && is_terminal_open_timeout(e))
             }
         };
 
@@ -1785,6 +1822,8 @@ fn main() {
             "\r\nConnection lost. Reconnecting in {}s (attempt {})...",
             delay, attempt
         );
+        // 退避睡眠不是主循环卡死，清掉 CLOSING 相位，避免看门狗把正常等待记成故障。
+        stall::enter(stall::IDLE);
         std::thread::sleep(std::time::Duration::from_secs(delay));
     }
 
@@ -3198,6 +3237,9 @@ async fn finish_connection(
     stall::enter(stall::CLOSING);
     tx.try_send(close_connection_message()).ok();
     drain_writer(tx, writer_task).await;
+    // 收尾完成后可能马上进入重连退避或下一轮握手；这些阶段没有本地阻塞，
+    // 不应继续沿用 CLOSING 让看门狗误报。
+    stall::enter(stall::IDLE);
 }
 
 fn open_terminal_message(terminal_id: i32, rows: u16, cols: u16) -> Message {
