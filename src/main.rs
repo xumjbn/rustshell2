@@ -3447,10 +3447,14 @@ async fn terminal_io_loop(
                     // there, so this is reconnectable.
                     Some(Err(e)) => {
                         log::info!("Stream error: {}", e);
+                        // 读半边先断开时也要关闭写半边。否则 writer task 会继续持有
+                        // relay socket，下一轮重连期间旧连接仍可能占住远端 terminal。
+                        finish_connection(tx, writer_task).await;
                         return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                     }
                     None => {
                         log::info!("Connection closed by peer");
+                        finish_connection(tx, writer_task).await;
                         return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                     }
                 };
@@ -3463,7 +3467,11 @@ async fn terminal_io_loop(
                         match resp.union {
                             Some(Union::Opened(o)) => {
                                 terminal_opened = o.success;
-                                if !o.success { bail!("Terminal open failed: {}", o.message); }
+                                if !o.success {
+                                    let message = o.message.clone();
+                                    finish_connection(tx, writer_task).await;
+                                    bail!("Terminal open failed: {}", message);
+                                }
                                 log::info!("Shell started (pid: {})", o.pid);
                                 // Say this before anything is drawn. Written into
                                 // a live screen it lands at whatever cursor
@@ -3586,7 +3594,11 @@ async fn terminal_io_loop(
                                 finish_connection(tx, writer_task).await;
                                 return Ok(SessionEnd::RemoteClosed);
                             }
-                            Some(Union::Error(e)) => bail!("Terminal error: {}", e.message),
+                            Some(Union::Error(e)) => {
+                                let message = e.message.clone();
+                                finish_connection(tx, writer_task).await;
+                                bail!("Terminal error: {}", message);
+                            }
                             _ => { log::debug!("TerminalResponse with empty union"); }
                         }
                     }
@@ -3613,6 +3625,7 @@ async fn terminal_io_loop(
                 // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
                 if writer_task.is_finished() {
                     log::info!("Writer task ended, connection lost");
+                    finish_connection(tx, writer_task).await;
                     return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                 }
 
