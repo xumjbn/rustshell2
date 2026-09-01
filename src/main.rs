@@ -19,6 +19,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 单次连接从 rendezvous TCP 到登录完成的总期限。各步骤另有局部超时，
 /// 这里负责兜住遗漏和多个慢步骤叠加，保证主循环一定能回到重试逻辑。
 const INITIAL_CONNECT_TIMEOUT_MS: u64 = 45_000;
+/// RustDesk 清理失联连接和 terminal helper 需要留出完整的服务端超时窗口。
+const REMOTE_CLEANUP_COOLDOWN_SECS: u64 = 60;
 
 // ── CLI arguments ──────────────────────────────────────────────────
 
@@ -82,6 +84,8 @@ enum SessionEnd {
     RemoteClosed,
     /// The link dropped; reconnect using the configured persistence policy.
     Disconnected,
+    /// 保活探测确认远端连接已经卡死。
+    RemoteStalled,
 }
 
 /// Stable terminal `service_id` used to isolate local slots.
@@ -168,6 +172,13 @@ fn should_retry_session_error(
         || attempt > 0
 }
 
+fn reconnect_delay(attempt: u32, wait_for_remote_cleanup: bool) -> std::time::Duration {
+    if wait_for_remote_cleanup {
+        return std::time::Duration::from_secs(REMOTE_CLEANUP_COOLDOWN_SECS);
+    }
+    std::time::Duration::from_secs(std::cmp::min(2u64.saturating_pow(attempt.min(5)), 30))
+}
+
 /// 持续刷屏时远端 reader 几乎始终就绪。`biased select` 不能让它无限连胜，
 /// 否则渲染、重画、writer 检查和本地输入所在的维护分支永远没有机会运行。
 const EVENT_LOOP_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
@@ -232,6 +243,18 @@ mod session_lifecycle_tests {
         assert!(is_retryable_connection_error(&timeout));
         assert!(!is_retryable_connection_error(&authentication));
         assert!(should_retry_session_error(0, false, false, false, true));
+    }
+
+    #[test]
+    fn stalled_remote_waits_for_server_cleanup() {
+        assert_eq!(
+            reconnect_delay(1, true),
+            std::time::Duration::from_secs(REMOTE_CLEANUP_COOLDOWN_SECS)
+        );
+        assert_eq!(
+            reconnect_delay(8, false),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -1875,6 +1898,11 @@ fn main() {
         // its buffered output. Only the first --new-session open is fresh.
         fresh_open = false;
 
+        // RustDesk 在传输层断开后仍会保留持久 terminal helper，先给连接管理器
+        // 时间清理旧 handler，再请求打开新的 terminal。
+        let wait_for_remote_cleanup = matches!(&outcome, Ok(SessionEnd::RemoteStalled))
+            || matches!(&outcome, Err(error) if is_terminal_open_timeout(error));
+
         // 同一个持久 service 被旧连接卡住时，登录仍会成功，但 OpenTerminal 永远
         // 没有回应。只在第一次遇到这个明确症状时切换新 service，避免后续重连不断
         // 创建新会话；新 service 后续仍保持稳定，断线可以继续接回。
@@ -1895,6 +1923,7 @@ fn main() {
                 break;
             }
             Ok(SessionEnd::Disconnected) => true,
+            Ok(SessionEnd::RemoteStalled) => true,
             Err(e) => {
                 eprintln!("\r\nError: {:#}", e);
                 // 首次普通连接错误通常是地址或密码错误，立即失败。切换到 fresh
@@ -1926,15 +1955,21 @@ fn main() {
         }
 
         attempt += 1;
-        // 2s, 4s, 8s ... capped at 30s.
-        let delay = std::cmp::min(2u64.saturating_pow(attempt.min(5)), 30);
+        let delay = reconnect_delay(attempt, wait_for_remote_cleanup);
+        if wait_for_remote_cleanup {
+            log::warn!(
+                "远端连接可能仍在清理，等待 {} 秒后再重连以避免叠加 terminal helper",
+                delay.as_secs()
+            );
+        }
         eprintln!(
             "\r\nConnection lost. Reconnecting in {}s (attempt {})...",
-            delay, attempt
+            delay.as_secs(),
+            attempt
         );
         // 退避睡眠不是主循环卡死，清掉 CLOSING 相位，避免看门狗把正常等待记成故障。
         stall::enter(stall::IDLE);
-        std::thread::sleep(std::time::Duration::from_secs(delay));
+        std::thread::sleep(delay);
     }
 
     // 退出路径上的每一步都要有上限，而且要能在日志里认出来。
@@ -3655,7 +3690,7 @@ async fn terminal_io_loop(
                             } else {
                                 log::warn!("RustDesk liveness probe {nonce} was not acknowledged within 15 seconds");
                                 finish_connection(tx, priority_tx, writer_task).await;
-                                return Ok(SessionEnd::Disconnected);
+                                return Ok(SessionEnd::RemoteStalled);
                             }
                         }
                     } else {
