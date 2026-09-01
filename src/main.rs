@@ -140,6 +140,18 @@ fn is_terminal_open_timeout(error: &anyhow::Error) -> bool {
         .contains("Timed out waiting for the remote shell")
 }
 
+/// fresh service 首次打开时，远端可能已经创建 helper，只是 Opened 回包被旧连接
+/// 拖延。此后必须固定重试同一个 service_id；再次换 ID 会继续堆 helper，而直接退出
+/// 则失去客户端自行恢复的机会。
+fn should_retry_session_error(
+    attempt: u32,
+    switched_to_fresh: bool,
+    fresh_fallback_used: bool,
+    terminal_open_timeout: bool,
+) -> bool {
+    switched_to_fresh || (fresh_fallback_used && terminal_open_timeout) || attempt > 0
+}
+
 /// vt100 和远端 PTY 都不接受 0 尺寸；宽高至少为 2，避免宽字符路径做 `cols - 2`
 /// 时下溢，也避开 vt100 0.15 在单行网格滚屏时的无效行索引。
 fn normalize_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
@@ -171,6 +183,18 @@ mod session_lifecycle_tests {
         );
         assert!(is_terminal_open_timeout(&error));
         assert!(!is_terminal_open_timeout(&anyhow::anyhow!("login failed")));
+    }
+
+    #[test]
+    fn fresh_service_open_timeout_keeps_the_same_service_retriable() {
+        assert!(should_retry_session_error(0, true, true, true));
+        assert!(should_retry_session_error(1, false, true, true));
+        assert!(should_retry_session_error(7, false, true, true));
+    }
+
+    #[test]
+    fn initial_non_terminal_error_still_fails_fast() {
+        assert!(!should_retry_session_error(0, false, false, false));
     }
 
     #[test]
@@ -1805,19 +1829,21 @@ fn main() {
             Ok(SessionEnd::Disconnected) => true,
             Err(e) => {
                 eprintln!("\r\nError: {:#}", e);
-                // A failure before the first successful session is usually a
-                // bad address or password — retrying would just repeat it.
-                // terminal open 超时只允许一次 service_id 恢复尝试。新的 service
-                // 也超时，说明远端 terminal service 已经整体失去响应；继续重连只会
-                // 在远端堆积更多卡住的连接，最后把 RustDesk 服务拖死。
-                if switched_to_fresh {
-                    true
-                } else if fresh_fallback_used && is_terminal_open_timeout(e) {
-                    log::error!("新的 service_id 仍无法打开远端终端，停止自动重连；请先恢复远端 RustDesk 服务");
-                    false
-                } else {
-                    attempt > 0
+                // 首次普通连接错误通常是地址或密码错误，立即失败。切换到 fresh
+                // service 后始终复用同一个 ID 退避重试：远端可能已创建 helper，
+                // 只是 Opened 回包迟到；再换 ID 会堆积 helper，停止则无法自恢复。
+                let open_timeout = is_terminal_open_timeout(e);
+                if fresh_fallback_used && open_timeout && !switched_to_fresh {
+                    log::warn!(
+                        "新的 service_id 暂未打开，将继续重试同一 service_id，等待远端终端服务自行恢复"
+                    );
                 }
+                should_retry_session_error(
+                    attempt,
+                    switched_to_fresh,
+                    fresh_fallback_used,
+                    open_timeout,
+                )
             }
         };
 
