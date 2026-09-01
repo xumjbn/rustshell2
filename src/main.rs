@@ -497,7 +497,7 @@ mod stall {
         "读本地剪贴板(arboard)",
         "剪贴板发送后的固定等待",
         "处理本地按键",
-        "关闭连接：等写任务把关闭帧冲上线",
+        "关闭连接：停止写任务",
         "退出：恢复本地终端模式",
         "退出：关闭 tokio 运行时",
     ];
@@ -1778,9 +1778,9 @@ fn main() {
         // 同一个持久 service 被旧连接卡住时，登录仍会成功，但 OpenTerminal 永远
         // 没有回应。只在第一次遇到这个明确症状时切换新 service，避免后续重连不断
         // 创建新会话；新 service 后续仍保持稳定，断线可以继续接回。
-        if !fresh_fallback_used
-            && matches!(&outcome, Err(error) if is_terminal_open_timeout(error))
-        {
+        let switched_to_fresh =
+            !fresh_fallback_used && matches!(&outcome, Err(error) if is_terminal_open_timeout(error));
+        if switched_to_fresh {
             fresh_fallback_used = true;
             service_id = fresh_service_id(&base, slot.id);
             fresh_open = true;
@@ -1801,9 +1801,17 @@ fn main() {
                 eprintln!("\r\nError: {:#}", e);
                 // A failure before the first successful session is usually a
                 // bad address or password — retrying would just repeat it.
-                // terminal open 超时例外：这通常是旧 persistent service 被卡住，
-                // 上面已经切换了 fresh service_id，必须允许它完成一次恢复重试。
-                attempt > 0 || (fresh_fallback_used && is_terminal_open_timeout(e))
+                // terminal open 超时只允许一次 service_id 恢复尝试。新的 service
+                // 也超时，说明远端 terminal service 已经整体失去响应；继续重连只会
+                // 在远端堆积更多卡住的连接，最后把 RustDesk 服务拖死。
+                if switched_to_fresh {
+                    true
+                } else if fresh_fallback_used && is_terminal_open_timeout(e) {
+                    log::error!("新的 service_id 仍无法打开远端终端，停止自动重连；请先恢复远端 RustDesk 服务");
+                    false
+                } else {
+                    attempt > 0
+                }
             }
         };
 
@@ -3175,12 +3183,10 @@ async fn writer_loop(mut writer: LinkWriter, mut rx: tokio::sync::mpsc::Receiver
     }
 }
 
-/// 等写任务把队列里剩下的消息真正冲上线。
+/// 正常关闭时，等待写任务把队列里的关闭帧冲上线。
 ///
-/// 退出路径必须走这一步。不等的话,函数一返回、写半边随即关掉,排在队列里的
-/// `CloseTerminal` 就没了——远端会留下一具「shell 已死、服务端仍登记着」的空
-/// 壳会话,下次不带 -n 重连正好接回它,拿到的是上次退出前那一屏,之后再无输出,
-/// 看起来就是卡死在上次 exit 的地方。
+/// 这个等待只用于远端已经确认终端关闭的健康路径；异常断线必须直接调用
+/// `abort_writer`，不能让协议收尾帧再次触发远端 terminal service 的同步锁。
 async fn drain_writer(
     tx: tokio::sync::mpsc::Sender<Message>,
     mut task: tokio::task::JoinHandle<()>,
@@ -3188,22 +3194,23 @@ async fn drain_writer(
     // 关掉发送端，写任务收完队列里剩下的就会自己结束。
     drop(tx);
     if timeout(500, &mut task).await.is_err() {
-        // CloseTerminal 很小，正常只需进入本地 TCP 缓冲。半秒仍写不动说明链路
-        // 已经失效；明确 abort，不能让一个脱离管理的 writer 拖住运行时退出。
-        log::debug!("writer did not drain in time; aborting it");
+        // 正常关闭只允许等待很短时间，避免收尾路径被网络写阻塞。
+        log::debug!("writer 未能及时排空，取消剩余写任务");
         task.abort();
-        // abort 只在下一个 await 点生效。写任务若正卡在一段不让出的同步代码里
-        // （加密一条大消息就是），这一等就是无限期的——退出路径上不能有任何
-        // 一步没有上限。
         if timeout(500, task).await.is_err() {
-            log::debug!("writer did not react to abort; leaving it to runtime shutdown");
+            log::debug!("writer 未响应取消，交由运行时回收");
         }
     }
 }
 
-/// Ask RustDesk to tear down the peer connection before dropping our TCP
-/// halves. Without this message the 1.4.6 Windows server accumulates relay
-/// sockets in CLOSE_WAIT and eventually stops servicing terminal requests.
+async fn abort_writer(tx: tokio::sync::mpsc::Sender<Message>, task: tokio::task::JoinHandle<()>) {
+    // 异常断线不能再排任何协议帧，否则远端可能进入同步收尾路径。
+    drop(tx);
+    task.abort();
+    let _ = timeout(500, task).await;
+}
+
+/// 构造明确用户退出时使用的 RustDesk 连接关闭帧。
 fn close_connection_message() -> Message {
     let mut misc = Misc::new();
     misc.set_close_reason(String::new());
@@ -3235,10 +3242,26 @@ async fn finish_connection(
     writer_task: tokio::task::JoinHandle<()>,
 ) {
     stall::enter(stall::CLOSING);
-    tx.try_send(close_connection_message()).ok();
-    drain_writer(tx, writer_task).await;
+    // 读写错误、探活超时和进程退出都属于异常断线。此时远端可能正卡在
+    // terminal service 的锁里，不能再发送 CloseReason 触发它的同步收尾。
+    abort_writer(tx, writer_task).await;
     // 收尾完成后可能马上进入重连退避或下一轮握手；这些阶段没有本地阻塞，
     // 不应继续沿用 CLOSING 让看门狗误报。
+    stall::enter(stall::IDLE);
+}
+
+async fn finish_connection_gracefully(
+    tx: tokio::sync::mpsc::Sender<Message>,
+    writer_task: tokio::task::JoinHandle<()>,
+) {
+    stall::enter(stall::CLOSING);
+    // 只有远端已经确认终端关闭时才走这个路径，避免把 CloseReason 发到
+    // 一个已经失去响应的 terminal service。
+    if tx.try_send(close_connection_message()).is_ok() {
+        drain_writer(tx, writer_task).await;
+    } else {
+        abort_writer(tx, writer_task).await;
+    }
     stall::enter(stall::IDLE);
 }
 
@@ -3405,6 +3428,7 @@ async fn terminal_io_loop(
         ($msg:expr) => {
             if let Err(e) = tx.try_send($msg) {
                 log::info!("Outbound send dropped ({e}), connection lost");
+                finish_connection(tx, writer_task).await;
                 return Ok(SessionEnd::Disconnected);
             }
         };
@@ -3616,7 +3640,7 @@ async fn terminal_io_loop(
                             Some(Union::Closed(c)) => {
                                 log::info!("Terminal closed (exit code: {})", c.exit_code);
                                 if quitting {
-                                    finish_connection(tx, writer_task).await;
+                                    finish_connection_gracefully(tx, writer_task).await;
                                     return Ok(SessionEnd::UserQuit);
                                 }
                                 // shell 自己退出了，顺手把服务端那条空壳记录也销毁，
@@ -3625,15 +3649,17 @@ async fn terminal_io_loop(
                                 //
                                 // 但同样要过健康检查：远端刚报完 shell 退出不代表它
                                 // 腾得出手做销毁，而销毁是持全局锁同步停 helper 的。
-                                if terminal_opened
+                                let close_remote = terminal_opened
                                     && may_close_remote(
                                         no_remote_close,
                                         pending_keepalive.map(|(_, sent_at)| sent_at.elapsed()),
-                                    )
-                                {
+                                    );
+                                if close_remote {
                                     tx.try_send(close_terminal_message(terminal_id)).ok();
+                                    finish_connection_gracefully(tx, writer_task).await;
+                                } else {
+                                    finish_connection(tx, writer_task).await;
                                 }
-                                finish_connection(tx, writer_task).await;
                                 return Ok(SessionEnd::RemoteClosed);
                             }
                             Some(Union::Error(e)) => {
@@ -3882,9 +3908,8 @@ async fn terminal_io_loop(
                     if data.is_empty() { continue; }
                     let quit_byte = (quit_key.to_ascii_lowercase() as u8) - b'a' + 1;
                     if data == [quit_byte] {
-                        // Close the shell by default. `--detach` keeps only the
-                        // persistent shell alive; both paths still send the
-                        // connection-level close handshake before dropping TCP.
+                        // 默认关闭远端 shell；`--detach` 只释放本地连接，保留持久会话。
+                        // 正常关闭要等远端确认后才发送连接级收尾帧。
                         if terminal_opened && !typed.is_empty() {
                             let mut a = TerminalAction::new();
                             a.set_data(TerminalData {

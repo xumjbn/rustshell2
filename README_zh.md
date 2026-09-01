@@ -47,8 +47,9 @@ rustshell [OPTIONS] --id <ID> --server <SERVER>
 
 会话始终声明 `terminal_persistent`，异常断线后可以接回。这是在规避 RustDesk 1.4.6 的服务端
 缺陷：非持久连接断开时，它会持有全局终端注册表锁并同步销毁 Windows helper；helper 一旦卡住，
-后续所有 shell 都无法打开。所有本地退出路径都会先发送 RustDesk 连接级的 `close_reason` 握手再释放
-中继 socket；缺少它时，1.4.6 Windows 服务端会残留 `CLOSE_WAIT`。
+后续所有 shell 都无法打开。异常断线时客户端直接释放 TCP 连接，不再发送连接级 `close_reason`，
+避免远端 helper 已卡住时再次进入服务端同步收尾路径。只有链路健康且用户按 Ctrl+Q 明确关闭时，
+才会在终端确认关闭后发送连接收尾帧。
 
 **销毁远端会话（`CloseTerminal`）只在一种情况下发生：用户按 Ctrl+Q，而且链路仍在应答保活探测。**
 同一把全局锁在销毁时也会被持有，helper 正忙（远端刷屏、跑 codex 之类）或已经卡住时，这一发会把

@@ -48,10 +48,11 @@ Options:
 Sessions advertise `terminal_persistent` so an abrupt disconnect remains
 reattachable. This avoids a RustDesk 1.4.6 bug: its non-persistent disconnect
 path tears down the Windows helper while holding the global terminal registry
-lock, and a stuck helper then prevents every later shell from opening. Every
-local exit sends RustDesk's connection-level `close_reason` handshake before
-releasing the relay socket; without it, the 1.4.6 Windows server leaves
-connections in `CLOSE_WAIT`.
+lock, and a stuck helper then prevents every later shell from opening. On an
+unexpected disconnect, rustshell drops the TCP connection without sending a
+connection-level `close_reason`; this avoids entering the server's synchronous
+close path while the terminal helper is already stuck. An explicit Ctrl+Q on a
+healthy link still sends the close handshake after the terminal confirms it.
 
 **Destroying the remote session (`CloseTerminal`) happens in exactly one case:
 the user pressed Ctrl+Q and the link is still answering liveness probes.**
