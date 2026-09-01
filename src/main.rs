@@ -195,6 +195,14 @@ mod session_lifecycle_tests {
     }
 
     #[test]
+    fn input_backlog_stops_before_remote_sync_queue_is_full() {
+        assert!(!input_backlog_exceeded(0, 0, 4096));
+        assert!(input_backlog_exceeded(MAX_UNANSWERED_INPUT_MESSAGES, 0, 1));
+        assert!(input_backlog_exceeded(0, MAX_UNANSWERED_INPUT_BYTES, 1));
+        assert!(input_backlog_exceeded(0, MAX_UNANSWERED_INPUT_BYTES - 1, 2));
+    }
+
+    #[test]
     fn input_reader_filters_release_but_keeps_press_and_paste() {
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -1778,15 +1786,13 @@ fn main() {
         // 同一个持久 service 被旧连接卡住时，登录仍会成功，但 OpenTerminal 永远
         // 没有回应。只在第一次遇到这个明确症状时切换新 service，避免后续重连不断
         // 创建新会话；新 service 后续仍保持稳定，断线可以继续接回。
-        let switched_to_fresh =
-            !fresh_fallback_used && matches!(&outcome, Err(error) if is_terminal_open_timeout(error));
+        let switched_to_fresh = !fresh_fallback_used
+            && matches!(&outcome, Err(error) if is_terminal_open_timeout(error));
         if switched_to_fresh {
             fresh_fallback_used = true;
             service_id = fresh_service_id(&base, slot.id);
             fresh_open = true;
-            log::warn!(
-                "持久终端打开超时，将切换到新的 service_id 绕过远端卡住的 terminal service"
-            );
+            log::warn!("持久终端打开超时，将切换到新的 service_id 绕过远端卡住的 terminal service");
         }
 
         let should_retry = match &outcome {
@@ -3140,6 +3146,16 @@ const SLOW_FLUSH: std::time::Duration = std::time::Duration::from_millis(50);
 /// 这么久没收到帧就记一笔。远端或链路不动了的信号。
 const QUIET_WARN: std::time::Duration = std::time::Duration::from_secs(5);
 
+// RustDesk 的远端 terminal 输入通道是有限的同步队列。没有输出确认时，
+// 客户端必须在远端队列耗尽之前停止继续灌入输入，否则服务线程会永久阻塞。
+const MAX_UNANSWERED_INPUT_MESSAGES: usize = 64;
+const MAX_UNANSWERED_INPUT_BYTES: usize = 256 * 1024;
+
+fn input_backlog_exceeded(messages: usize, bytes: usize, next_bytes: usize) -> bool {
+    messages >= MAX_UNANSWERED_INPUT_MESSAGES
+        || bytes.saturating_add(next_bytes) > MAX_UNANSWERED_INPUT_BYTES
+}
+
 /// 一条消息允许花多久写上线。
 ///
 /// 按键之类的小消息给固定预算就够;剪贴板图片能有好几 MB,慢一点的中继上本来
@@ -3159,8 +3175,26 @@ fn send_budget(msg: &Message) -> u64 {
 /// 也不会重连——正是「跑一阵子整个窗口全死」的样子。
 ///
 /// 拆开之后读永远在跑,远端的写能排空、随即恢复读,堵住的这一边自己就通了。
-async fn writer_loop(mut writer: LinkWriter, mut rx: tokio::sync::mpsc::Receiver<Message>) {
-    while let Some(msg) = rx.recv().await {
+async fn writer_loop(
+    mut writer: LinkWriter,
+    mut priority_rx: tokio::sync::mpsc::Receiver<Message>,
+    mut rx: tokio::sync::mpsc::Receiver<Message>,
+) {
+    let mut priority_open = true;
+    let mut normal_open = true;
+    while priority_open || normal_open {
+        let msg = tokio::select! {
+            biased;
+            msg = priority_rx.recv(), if priority_open => match msg {
+                Some(msg) => Some(msg),
+                None => { priority_open = false; None }
+            },
+            msg = rx.recv(), if normal_open => match msg {
+                Some(msg) => Some(msg),
+                None => { normal_open = false; None }
+            },
+        };
+        let Some(msg) = msg else { continue };
         let started = std::time::Instant::now();
         match timeout(send_budget(&msg), writer.send(&msg)).await {
             Ok(Ok(())) => {
@@ -3189,10 +3223,12 @@ async fn writer_loop(mut writer: LinkWriter, mut rx: tokio::sync::mpsc::Receiver
 /// `abort_writer`，不能让协议收尾帧再次触发远端 terminal service 的同步锁。
 async fn drain_writer(
     tx: tokio::sync::mpsc::Sender<Message>,
+    priority_tx: tokio::sync::mpsc::Sender<Message>,
     mut task: tokio::task::JoinHandle<()>,
 ) {
     // 关掉发送端，写任务收完队列里剩下的就会自己结束。
     drop(tx);
+    drop(priority_tx);
     if timeout(500, &mut task).await.is_err() {
         // 正常关闭只允许等待很短时间，避免收尾路径被网络写阻塞。
         log::debug!("writer 未能及时排空，取消剩余写任务");
@@ -3203,9 +3239,14 @@ async fn drain_writer(
     }
 }
 
-async fn abort_writer(tx: tokio::sync::mpsc::Sender<Message>, task: tokio::task::JoinHandle<()>) {
+async fn abort_writer(
+    tx: tokio::sync::mpsc::Sender<Message>,
+    priority_tx: tokio::sync::mpsc::Sender<Message>,
+    task: tokio::task::JoinHandle<()>,
+) {
     // 异常断线不能再排任何协议帧，否则远端可能进入同步收尾路径。
     drop(tx);
+    drop(priority_tx);
     task.abort();
     let _ = timeout(500, task).await;
 }
@@ -3239,12 +3280,13 @@ fn echo_test_delay(delay: TestDelay) -> Message {
 
 async fn finish_connection(
     tx: tokio::sync::mpsc::Sender<Message>,
+    priority_tx: tokio::sync::mpsc::Sender<Message>,
     writer_task: tokio::task::JoinHandle<()>,
 ) {
     stall::enter(stall::CLOSING);
     // 读写错误、探活超时和进程退出都属于异常断线。此时远端可能正卡在
     // terminal service 的锁里，不能再发送 CloseReason 触发它的同步收尾。
-    abort_writer(tx, writer_task).await;
+    abort_writer(tx, priority_tx, writer_task).await;
     // 收尾完成后可能马上进入重连退避或下一轮握手；这些阶段没有本地阻塞，
     // 不应继续沿用 CLOSING 让看门狗误报。
     stall::enter(stall::IDLE);
@@ -3252,15 +3294,16 @@ async fn finish_connection(
 
 async fn finish_connection_gracefully(
     tx: tokio::sync::mpsc::Sender<Message>,
+    priority_tx: tokio::sync::mpsc::Sender<Message>,
     writer_task: tokio::task::JoinHandle<()>,
 ) {
     stall::enter(stall::CLOSING);
     // 只有远端已经确认终端关闭时才走这个路径，避免把 CloseReason 发到
     // 一个已经失去响应的 terminal service。
     if tx.try_send(close_connection_message()).is_ok() {
-        drain_writer(tx, writer_task).await;
+        drain_writer(tx, priority_tx, writer_task).await;
     } else {
-        abort_writer(tx, writer_task).await;
+        abort_writer(tx, priority_tx, writer_task).await;
     }
     stall::enter(stall::IDLE);
 }
@@ -3376,7 +3419,8 @@ async fn terminal_io_loop(
 
     let (mut reader, writer) = conn.split();
     let (tx, rx) = tokio::sync::mpsc::channel::<Message>(OUTBOUND_QUEUE);
-    let writer_task = tokio::spawn(writer_loop(writer, rx));
+    let (priority_tx, priority_rx) = tokio::sync::mpsc::channel::<Message>(8);
+    let writer_task = tokio::spawn(writer_loop(writer, priority_rx, rx));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -3404,6 +3448,8 @@ async fn terminal_io_loop(
     let mut quiet_logged = false;
     // 最近一次把真实输入送出去的时刻，以及「敲了没回音」最近一次报告的时刻。
     let mut last_input_at: Option<std::time::Instant> = None;
+    let mut unanswered_input_messages = 0usize;
+    let mut unanswered_input_bytes = 0usize;
     let mut quiet_reported_at: Option<std::time::Instant> = None;
     // 一直没回音时每隔这么久再记一笔，好让日志的时间戳能画出整段静默。
     const QUIET_REPEAT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -3428,7 +3474,17 @@ async fn terminal_io_loop(
         ($msg:expr) => {
             if let Err(e) = tx.try_send($msg) {
                 log::info!("Outbound send dropped ({e}), connection lost");
-                finish_connection(tx, writer_task).await;
+                finish_connection(tx, priority_tx, writer_task).await;
+                return Ok(SessionEnd::Disconnected);
+            }
+        };
+    }
+
+    macro_rules! send_priority {
+        ($msg:expr) => {
+            if let Err(e) = priority_tx.try_send($msg) {
+                log::info!("Priority send dropped ({e}), connection lost");
+                finish_connection(tx, priority_tx, writer_task).await;
                 return Ok(SessionEnd::Disconnected);
             }
         };
@@ -3446,13 +3502,13 @@ async fn terminal_io_loop(
 
             _ = &mut open_timeout, if !terminal_opened => {
                 log::error!("Remote terminal did not open within 12 seconds");
-                finish_connection(tx, writer_task).await;
+                finish_connection(tx, priority_tx, writer_task).await;
                 bail!("Timed out waiting for the remote shell; the target RustDesk terminal service may be stuck");
             }
 
             _ = &mut close_timeout, if quitting => {
                 log::debug!("Remote did not confirm terminal close within 2 seconds");
-                finish_connection(tx, writer_task).await;
+                finish_connection(tx, priority_tx, writer_task).await;
                 return Ok(SessionEnd::UserQuit);
             }
 
@@ -3465,12 +3521,12 @@ async fn terminal_io_loop(
                     // 同槽位连回去还是它。
                     Some(Err(e)) => {
                         log::info!("Local input stream failed: {e}; leaving the remote session in place");
-                        finish_connection(tx, writer_task).await;
+                        finish_connection(tx, priority_tx, writer_task).await;
                         return Ok(SessionEnd::UserQuit);
                     }
                     None => {
                         log::info!("Local input stream closed; leaving the remote session in place");
-                        finish_connection(tx, writer_task).await;
+                        finish_connection(tx, priority_tx, writer_task).await;
                         return Ok(SessionEnd::UserQuit);
                     }
                 }
@@ -3483,7 +3539,7 @@ async fn terminal_io_loop(
                 // 卡在 codex 的输出里被强退，这一发 CloseTerminal 打到一个正忙的
                 // Windows helper 上，把整个 RustDesk 服务锁死了。
                 log::info!("Process signal received; leaving the remote session in place");
-                finish_connection(tx, writer_task).await;
+                finish_connection(tx, priority_tx, writer_task).await;
                 return Ok(SessionEnd::UserQuit);
             }
 
@@ -3492,12 +3548,12 @@ async fn terminal_io_loop(
                     if let Some((nonce, sent_at)) = pending_keepalive {
                         if sent_at.elapsed() >= std::time::Duration::from_secs(15) {
                             log::warn!("RustDesk liveness probe {nonce} was not acknowledged within 15 seconds");
-                            finish_connection(tx, writer_task).await;
+                            finish_connection(tx, priority_tx, writer_task).await;
                             return Ok(SessionEnd::Disconnected);
                         }
                     } else {
                         keepalive_nonce = keepalive_nonce.wrapping_add(1);
-                        send_out!(keepalive_message(keepalive_nonce));
+                        send_priority!(keepalive_message(keepalive_nonce));
                         pending_keepalive = Some((keepalive_nonce, time::Instant::now()));
                     }
                     // Prove to other local instances that this slot is still ours.
@@ -3515,12 +3571,12 @@ async fn terminal_io_loop(
                         log::info!("Stream error: {}", e);
                         // 读半边先断开时也要关闭写半边。否则 writer task 会继续持有
                         // relay socket，下一轮重连期间旧连接仍可能占住远端 terminal。
-                        finish_connection(tx, writer_task).await;
+                        finish_connection(tx, priority_tx, writer_task).await;
                         return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                     }
                     None => {
                         log::info!("Connection closed by peer");
-                        finish_connection(tx, writer_task).await;
+                        finish_connection(tx, priority_tx, writer_task).await;
                         return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                     }
                 };
@@ -3535,7 +3591,7 @@ async fn terminal_io_loop(
                                 terminal_opened = o.success;
                                 if !o.success {
                                     let message = o.message.clone();
-                                    finish_connection(tx, writer_task).await;
+                                    finish_connection(tx, priority_tx, writer_task).await;
                                     bail!("Terminal open failed: {}", message);
                                 }
                                 log::info!("Shell started (pid: {})", o.pid);
@@ -3590,6 +3646,10 @@ async fn terminal_io_loop(
                                 let output = if data.compressed {
                                     zstd_decompress(&data.data)
                                 } else { data.data.to_vec() };
+                                if !output.is_empty() {
+                                    unanswered_input_messages = 0;
+                                    unanswered_input_bytes = 0;
+                                }
                                 // The very first frame also gets the replay
                                 // treatment: it is the point where the terminal
                                 // still carries our connection logs, and the
@@ -3640,7 +3700,7 @@ async fn terminal_io_loop(
                             Some(Union::Closed(c)) => {
                                 log::info!("Terminal closed (exit code: {})", c.exit_code);
                                 if quitting {
-                                    finish_connection_gracefully(tx, writer_task).await;
+                                    finish_connection_gracefully(tx, priority_tx, writer_task).await;
                                     return Ok(SessionEnd::UserQuit);
                                 }
                                 // shell 自己退出了，顺手把服务端那条空壳记录也销毁，
@@ -3656,15 +3716,15 @@ async fn terminal_io_loop(
                                     );
                                 if close_remote {
                                     tx.try_send(close_terminal_message(terminal_id)).ok();
-                                    finish_connection_gracefully(tx, writer_task).await;
+                                    finish_connection_gracefully(tx, priority_tx, writer_task).await;
                                 } else {
-                                    finish_connection(tx, writer_task).await;
+                                    finish_connection(tx, priority_tx, writer_task).await;
                                 }
                                 return Ok(SessionEnd::RemoteClosed);
                             }
                             Some(Union::Error(e)) => {
                                 let message = e.message.clone();
-                                finish_connection(tx, writer_task).await;
+                                finish_connection(tx, priority_tx, writer_task).await;
                                 bail!("Terminal error: {}", message);
                             }
                             _ => { log::debug!("TerminalResponse with empty union"); }
@@ -3680,7 +3740,7 @@ async fn terminal_io_loop(
                             // waits for the same message before scheduling another.
                             // Failing to echo it leaves an idle terminal connection
                             // in a permanently half-probed state.
-                            send_out!(echo_test_delay(delay));
+                            send_priority!(echo_test_delay(delay));
                         }
                     }
                     Some(message::Union::Hash(_)) => {}
@@ -3693,7 +3753,7 @@ async fn terminal_io_loop(
                 // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
                 if writer_task.is_finished() {
                     log::info!("Writer task ended, connection lost");
-                    finish_connection(tx, writer_task).await;
+                    finish_connection(tx, priority_tx, writer_task).await;
                     return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
                 }
 
@@ -3818,12 +3878,28 @@ async fn terminal_io_loop(
                             payload.extend_from_slice(b"\x1b[200~");
                             payload.extend_from_slice(body.as_bytes());
                             payload.extend_from_slice(b"\x1b[201~");
+                            let input_bytes = payload.len();
+                            if input_backlog_exceeded(
+                                unanswered_input_messages,
+                                unanswered_input_bytes,
+                                input_bytes,
+                            ) {
+                                log::warn!(
+                                    "远端长时间没有输出，停止发送输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
+                                    unanswered_input_messages,
+                                    unanswered_input_bytes,
+                                );
+                                finish_connection(tx, priority_tx, writer_task).await;
+                                return Ok(SessionEnd::Disconnected);
+                            }
                             let mut a = TerminalAction::new();
                             a.set_data(TerminalData { terminal_id, data: payload.into(), compressed: false, ..Default::default() });
                             let mut m = Message::new(); m.set_terminal_action(a);
                             log::debug!("Input: queueing {} pasted bytes", body.len());
                             last_input_at = Some(std::time::Instant::now());
                             send_out!(m);
+                            unanswered_input_messages += 1;
+                            unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
                             continue;
                         }
                     };
@@ -3930,14 +4006,14 @@ async fn terminal_io_loop(
                         );
                         if detach {
                             log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
-                            finish_connection(tx, writer_task).await;
+                            finish_connection(tx, priority_tx, writer_task).await;
                             return Ok(SessionEnd::UserQuit);
                         } else if !may_close {
                             log::warn!(
                                 "Quitting without closing the remote terminal: the link is not answering liveness probes. \
                                  The shell stays on the remote; reconnect to the same slot to get it back."
                             );
-                            finish_connection(tx, writer_task).await;
+                            finish_connection(tx, priority_tx, writer_task).await;
                             return Ok(SessionEnd::UserQuit);
                         } else {
                             log::info!("Closing terminal (Ctrl+{})...", quit_key.to_ascii_uppercase());
@@ -3956,7 +4032,21 @@ async fn terminal_io_loop(
                 }
 
                 if terminal_opened && !typed.is_empty() {
-                    log::debug!("Input: queueing {} typed bytes", typed.len());
+                    let input_bytes = typed.len();
+                    if input_backlog_exceeded(
+                        unanswered_input_messages,
+                        unanswered_input_bytes,
+                        input_bytes,
+                    ) {
+                        log::warn!(
+                            "远端长时间没有输出，停止发送输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
+                            unanswered_input_messages,
+                            unanswered_input_bytes,
+                        );
+                        finish_connection(tx, priority_tx, writer_task).await;
+                        return Ok(SessionEnd::Disconnected);
+                    }
+                    log::debug!("Input: queueing {} typed bytes", input_bytes);
                     last_input_at = Some(std::time::Instant::now());
                     let mut a = TerminalAction::new();
                     a.set_data(TerminalData {
@@ -3968,6 +4058,8 @@ async fn terminal_io_loop(
                     let mut m = Message::new();
                     m.set_terminal_action(a);
                     send_out!(m);
+                    unanswered_input_messages += 1;
+                    unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
                 }
             }
         }
