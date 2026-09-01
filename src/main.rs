@@ -3444,6 +3444,7 @@ async fn terminal_io_loop(
     // 第一批未画出数据的时刻，以及最近一批的时刻。
     let mut pending_since: Option<std::time::Instant> = None;
     let mut last_data = std::time::Instant::now();
+    let mut last_peer_activity = std::time::Instant::now();
     // 一段静默只提醒一次，否则日志会被刷屏。
     let mut quiet_logged = false;
     // 最近一次把真实输入送出去的时刻，以及「敲了没回音」最近一次报告的时刻。
@@ -3547,9 +3548,16 @@ async fn terminal_io_loop(
                 if terminal_opened {
                     if let Some((nonce, sent_at)) = pending_keepalive {
                         if sent_at.elapsed() >= std::time::Duration::from_secs(15) {
-                            log::warn!("RustDesk liveness probe {nonce} was not acknowledged within 15 seconds");
-                            finish_connection(tx, priority_tx, writer_task).await;
-                            return Ok(SessionEnd::Disconnected);
+                            if last_peer_activity.elapsed() < std::time::Duration::from_secs(15) {
+                                log::debug!(
+                                    "RustDesk liveness probe {nonce} 回显延迟，但对端仍有协议活动；继续保持连接"
+                                );
+                                pending_keepalive = None;
+                            } else {
+                                log::warn!("RustDesk liveness probe {nonce} was not acknowledged within 15 seconds");
+                                finish_connection(tx, priority_tx, writer_task).await;
+                                return Ok(SessionEnd::Disconnected);
+                            }
                         }
                     } else {
                         keepalive_nonce = keepalive_nonce.wrapping_add(1);
@@ -3583,6 +3591,7 @@ async fn terminal_io_loop(
                 let msg_in = match Message::parse_from_bytes(&bytes) {
                     Ok(m) => m, Err(e) => { log::error!("Parse: {} (raw: {:02x?})", e, bytes.as_ref()); continue; }
                 };
+                last_peer_activity = std::time::Instant::now();
                 match msg_in.union {
                     Some(message::Union::TerminalResponse(resp)) => {
                         use terminal_response::Union;
