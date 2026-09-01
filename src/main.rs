@@ -16,6 +16,9 @@ use tokio::time;
 
 const APP_NAME: &str = "RustShell";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 单次连接从 rendezvous TCP 到登录完成的总期限。各步骤另有局部超时，
+/// 这里负责兜住遗漏和多个慢步骤叠加，保证主循环一定能回到重试逻辑。
+const INITIAL_CONNECT_TIMEOUT_MS: u64 = 45_000;
 
 // ── CLI arguments ──────────────────────────────────────────────────
 
@@ -140,6 +143,15 @@ fn is_terminal_open_timeout(error: &anyhow::Error) -> bool {
         .contains("Timed out waiting for the remote shell")
 }
 
+/// 网络和握手超时属于瞬时故障，首次启动也应该退避重试；认证、设备离线和
+/// 参数错误则立即返回，避免把确定性错误伪装成卡死。
+fn is_retryable_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("timed out") || message.contains("timeout")
+    })
+}
+
 /// fresh service 首次打开时，远端可能已经创建 helper，只是 Opened 回包被旧连接
 /// 拖延。此后必须固定重试同一个 service_id；再次换 ID 会继续堆 helper，而直接退出
 /// 则失去客户端自行恢复的机会。
@@ -148,8 +160,24 @@ fn should_retry_session_error(
     switched_to_fresh: bool,
     fresh_fallback_used: bool,
     terminal_open_timeout: bool,
+    retryable_connection_error: bool,
 ) -> bool {
-    switched_to_fresh || (fresh_fallback_used && terminal_open_timeout) || attempt > 0
+    switched_to_fresh
+        || (fresh_fallback_used && terminal_open_timeout)
+        || retryable_connection_error
+        || attempt > 0
+}
+
+/// 持续刷屏时远端 reader 几乎始终就绪。`biased select` 不能让它无限连胜，
+/// 否则渲染、重画、writer 检查和本地输入所在的维护分支永远没有机会运行。
+const EVENT_LOOP_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn may_poll_remote_output(
+    pending_input_empty: bool,
+    quitting: bool,
+    since_maintenance: std::time::Duration,
+) -> bool {
+    quitting || (pending_input_empty && since_maintenance < EVENT_LOOP_SLICE)
 }
 
 /// vt100 和远端 PTY 都不接受 0 尺寸；宽高至少为 2，避免宽字符路径做 `cols - 2`
@@ -187,14 +215,39 @@ mod session_lifecycle_tests {
 
     #[test]
     fn fresh_service_open_timeout_keeps_the_same_service_retriable() {
-        assert!(should_retry_session_error(0, true, true, true));
-        assert!(should_retry_session_error(1, false, true, true));
-        assert!(should_retry_session_error(7, false, true, true));
+        assert!(should_retry_session_error(0, true, true, true, true));
+        assert!(should_retry_session_error(1, false, true, true, true));
+        assert!(should_retry_session_error(7, false, true, true, true));
     }
 
     #[test]
     fn initial_non_terminal_error_still_fails_fast() {
-        assert!(!should_retry_session_error(0, false, false, false));
+        assert!(!should_retry_session_error(0, false, false, false, false));
+    }
+
+    #[test]
+    fn initial_handshake_timeout_is_retried() {
+        let timeout = anyhow::anyhow!("Initial connection attempt timed out after 45 seconds");
+        let authentication = anyhow::anyhow!("Login failed: wrong password");
+        assert!(is_retryable_connection_error(&timeout));
+        assert!(!is_retryable_connection_error(&authentication));
+        assert!(should_retry_session_error(0, false, false, false, true));
+    }
+
+    #[test]
+    fn continuous_remote_output_yields_to_maintenance_each_slice() {
+        assert!(may_poll_remote_output(
+            true,
+            false,
+            EVENT_LOOP_SLICE - std::time::Duration::from_millis(1),
+        ));
+        assert!(!may_poll_remote_output(true, false, EVENT_LOOP_SLICE,));
+        assert!(!may_poll_remote_output(
+            false,
+            false,
+            std::time::Duration::ZERO,
+        ));
+        assert!(may_poll_remote_output(false, true, EVENT_LOOP_SLICE,));
     }
 
     #[test]
@@ -1787,22 +1840,37 @@ fn main() {
         // 网络连接和服务端握手期间没有本地阻塞调用，不能沿用上一次收尾时的相位，
         // 否则重连等待超过三秒会被看门狗误报成卡死在 CloseTerminal。
         stall::enter(stall::IDLE);
-        let outcome = rt.block_on(run(
-            args.id.clone(),
-            args.key.clone(),
-            args.server.clone(),
-            args.port,
-            password.clone(),
-            args.quit_key,
-            service_id.clone(),
-            &slot,
-            log_path.clone(),
-            args.detach,
-            args.render,
-            fresh_open,
-            args.no_remote_close,
-            &mut input_events,
-        ));
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let outcome = rt.block_on(async {
+            let session = run(
+                args.id.clone(),
+                args.key.clone(),
+                args.server.clone(),
+                args.port,
+                password.clone(),
+                args.quit_key,
+                service_id.clone(),
+                &slot,
+                log_path.clone(),
+                args.detach,
+                args.render,
+                fresh_open,
+                args.no_remote_close,
+                connected_tx,
+                &mut input_events,
+            );
+            tokio::pin!(session);
+            tokio::select! {
+                result = &mut session => result,
+                _ = time::sleep(std::time::Duration::from_millis(INITIAL_CONNECT_TIMEOUT_MS)) => {
+                    Err(anyhow::anyhow!(
+                        "Initial connection attempt timed out after {} seconds",
+                        INITIAL_CONNECT_TIMEOUT_MS / 1_000,
+                    ))
+                }
+                _ = connected_rx => session.await,
+            }
+        });
         // A reconnect always targets the same persistent service and replays
         // its buffered output. Only the first --new-session open is fresh.
         fresh_open = false;
@@ -1833,6 +1901,7 @@ fn main() {
                 // service 后始终复用同一个 ID 退避重试：远端可能已创建 helper，
                 // 只是 Opened 回包迟到；再换 ID 会堆积 helper，停止则无法自恢复。
                 let open_timeout = is_terminal_open_timeout(e);
+                let retryable_connection_error = is_retryable_connection_error(e);
                 if fresh_fallback_used && open_timeout && !switched_to_fresh {
                     log::warn!(
                         "新的 service_id 暂未打开，将继续重试同一 service_id，等待远端终端服务自行恢复"
@@ -1843,6 +1912,7 @@ fn main() {
                     switched_to_fresh,
                     fresh_fallback_used,
                     open_timeout,
+                    retryable_connection_error,
                 )
             }
         };
@@ -1902,6 +1972,7 @@ async fn run(
     render: bool,
     fresh_open: bool,
     no_remote_close: bool,
+    connected: tokio::sync::oneshot::Sender<()>,
     input_events: &mut tokio::sync::mpsc::UnboundedReceiver<InputResult>,
 ) -> Result<SessionEnd> {
     let rendezvous_addr = format!("{}:{}", server, port);
@@ -2137,6 +2208,7 @@ async fn run(
             log::info!("Login accepted (peer omitted optional platform metadata)");
         }
     }
+    let _ = connected.send(());
 
     // Phase 6: Terminal I/O
     terminal_io_loop(
@@ -3490,6 +3562,7 @@ async fn terminal_io_loop(
     let mut resize_target: Option<(u16, u16)> = None;
     let mut last_size_poll = std::time::Instant::now();
     let mut last_repaint_try = std::time::Instant::now();
+    let mut last_maintenance = std::time::Instant::now();
 
     /// 把消息交给写任务。
     ///
@@ -3595,7 +3668,11 @@ async fn terminal_io_loop(
                 }
             }
 
-            res = reader.next(), if pending_input.is_empty() || quitting => {
+            res = reader.next(), if may_poll_remote_output(
+                pending_input.is_empty(),
+                quitting,
+                last_maintenance.elapsed(),
+            ) => {
                 let bytes = match res {
                     Some(Ok(b)) => b,
                     // Both mean the transport died, not that the remote shell
@@ -3784,6 +3861,7 @@ async fn terminal_io_loop(
             }
 
             _ = input_timer.tick(), if !quitting => {
+                last_maintenance = std::time::Instant::now();
                 // 写任务死了就等于链路断了。靠下一次发送去发现的话，空闲时要
                 // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
                 if writer_task.is_finished() {
