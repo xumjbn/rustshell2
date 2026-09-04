@@ -77,6 +77,7 @@ struct Args {
 }
 
 /// Why a session ended — decides whether reconnecting makes sense.
+#[allow(dead_code)]
 enum SessionEnd {
     /// User pressed the quit key.
     UserQuit,
@@ -181,8 +182,10 @@ fn reconnect_delay(attempt: u32, wait_for_remote_cleanup: bool) -> std::time::Du
 
 /// 持续刷屏时远端 reader 几乎始终就绪。`biased select` 不能让它无限连胜，
 /// 否则渲染、重画、writer 检查和本地输入所在的维护分支永远没有机会运行。
+#[allow(dead_code)]
 const EVENT_LOOP_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
 
+#[allow(dead_code)]
 fn may_poll_remote_output(
     pending_input_empty: bool,
     quitting: bool,
@@ -301,6 +304,7 @@ mod session_lifecycle_tests {
         assert!(input_backlog_exceeded(0, MAX_UNANSWERED_INPUT_BYTES, 1));
         assert!(input_backlog_exceeded(0, MAX_UNANSWERED_INPUT_BYTES - 1, 2));
     }
+
 
     #[test]
     fn input_reader_filters_release_but_keeps_press_and_paste() {
@@ -726,24 +730,39 @@ fn stdout_sender() -> &'static std::sync::mpsc::SyncSender<StdoutCommand> {
     static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<StdoutCommand>> =
         std::sync::OnceLock::new();
     SENDER.get_or_init(|| {
-        // 四秒左右的完整帧余量。队列满时宁可丢一帧并在下一帧整屏重画，也不能让
-        // stdout 反压堵住网络与输入循环，否则连 Ctrl+Q 都读不到。
-        let (tx, rx) = std::sync::mpsc::sync_channel::<StdoutCommand>(64);
+        // 留出充足的帧缓冲容量，支持高频刷屏与大块重绘。
+        let (tx, rx) = std::sync::mpsc::sync_channel::<StdoutCommand>(65536);
         std::thread::Builder::new()
             .name("rustshell-stdout".to_owned())
             .spawn(move || {
+                let mut stdout = std::io::stdout();
                 while let Ok(command) = rx.recv() {
-                    let mut stdout = std::io::stdout();
                     match command {
                         StdoutCommand::Write(data) => {
-                            // 写控制台是同步系统调用,在 Windows 上还要抢控制台
-                            // 锁。它卡住时整个窗口就不动了,所以单独标一个相位。
                             stall::out_enter(stall::OUT_WRITE);
                             stdout.write_all(&data).ok();
-                            stall::out_enter(stall::OUT_FLUSH);
-                            stdout.flush().ok();
                             stall::QUEUED_BYTES
                                 .fetch_sub(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            // 批量排空队列中已就绪的所有写指令，合并为单次 flush，大幅降低系统调用开销
+                            while let Ok(next) = rx.try_recv() {
+                                match next {
+                                    StdoutCommand::Write(d) => {
+                                        stdout.write_all(&d).ok();
+                                        stall::QUEUED_BYTES.fetch_sub(
+                                            d.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                    }
+                                    StdoutCommand::Flush(done) => {
+                                        stall::out_enter(stall::OUT_FLUSH);
+                                        stdout.flush().ok();
+                                        done.try_send(()).ok();
+                                        stall::out_enter(stall::OUT_WRITE);
+                                    }
+                                }
+                            }
+                            stall::out_enter(stall::OUT_FLUSH);
+                            stdout.flush().ok();
                             stall::out_enter(stall::OUT_IDLE);
                         }
                         StdoutCommand::Flush(done) => {
@@ -1256,6 +1275,7 @@ impl Screen {
     /// 里于是全是某一行的前缀，看着像是被截断了。
     fn absorb(&mut self, data: &[u8]) {
         if self.passthrough {
+            self.model.process(data);
             write_stdout(data);
             return;
         }
@@ -1347,6 +1367,7 @@ impl Screen {
     }
 
     /// 收下并立刻画出来。等价于 absorb 后紧跟 flush。
+    #[allow(dead_code)]
     fn feed(&mut self, data: &[u8]) {
         self.absorb(data);
         self.flush();
@@ -1475,6 +1496,7 @@ impl Screen {
         if self.passthrough {
             self.rows = rows;
             self.cols = cols;
+            self.model.set_size(rows, cols);
             // 直通模式没有模型可以重画，只能把本地清成已知状态再让远端自己
             // 重来。终端刚按自己的规则回流过一遍，留在屏幕上的是错位的旧内容，
             // 不清掉的话远端没覆盖到的地方会一直花着。用 2J 而不是 3J——
@@ -3281,8 +3303,8 @@ const QUIET_WARN: std::time::Duration = std::time::Duration::from_secs(5);
 
 // RustDesk 的远端 terminal 输入通道是有限的同步队列。没有输出确认时，
 // 客户端必须在远端队列耗尽之前停止继续灌入输入，否则服务线程会永久阻塞。
-const MAX_UNANSWERED_INPUT_MESSAGES: usize = 64;
-const MAX_UNANSWERED_INPUT_BYTES: usize = 256 * 1024;
+const MAX_UNANSWERED_INPUT_MESSAGES: usize = 256;
+const MAX_UNANSWERED_INPUT_BYTES: usize = 1024 * 1024;
 
 fn input_backlog_exceeded(messages: usize, bytes: usize, next_bytes: usize) -> bool {
     messages >= MAX_UNANSWERED_INPUT_MESSAGES
@@ -3597,7 +3619,7 @@ async fn terminal_io_loop(
     let mut resize_target: Option<(u16, u16)> = None;
     let mut last_size_poll = std::time::Instant::now();
     let mut last_repaint_try = std::time::Instant::now();
-    let mut last_maintenance = std::time::Instant::now();
+    let mut _last_maintenance = std::time::Instant::now();
 
     /// 把消息交给写任务。
     ///
@@ -3703,11 +3725,322 @@ async fn terminal_io_loop(
                 }
             }
 
-            res = reader.next(), if may_poll_remote_output(
-                pending_input.is_empty(),
-                quitting,
-                last_maintenance.elapsed(),
-            ) => {
+            _ = input_timer.tick(), if !quitting => {
+                _last_maintenance = std::time::Instant::now();
+                // 写任务死了就等于链路断了。靠下一次发送去发现的话，空闲时要
+                // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
+                if writer_task.is_finished() {
+                    log::info!("Writer task ended, connection lost");
+                    finish_connection(tx, priority_tx, writer_task).await;
+                    return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
+                }
+
+                if let Some(since) = pending_since {
+                    if last_data.elapsed() >= SETTLE || since.elapsed() >= MAX_HOLD {
+                        let started = std::time::Instant::now();
+                        stall::enter(stall::FLUSH);
+                        screen.flush();
+                        if started.elapsed() >= SLOW_FLUSH {
+                            log::debug!("flush took {:?}", started.elapsed());
+                        }
+                        pending_since = None;
+                    }
+                }
+
+                // 丢过帧就一直重试整屏重画，直到本地终端喘过气来。间隔放宽到
+                // 200 毫秒：队列还满着的时候每 20 毫秒重造一屏纯属白烧 CPU，
+                // 而且只会让本来就堵着的队列更堵。
+                if screen.needs_repaint()
+                    && last_repaint_try.elapsed() >= std::time::Duration::from_millis(200)
+                {
+                    last_repaint_try = std::time::Instant::now();
+                    stall::enter(stall::REPAINT);
+                    screen.render();
+                }
+
+                // 卡死时日志的最后一行要能指认是哪一环:收不到帧了(远端或链路
+                // 堵了),还是收得到但画不出来(本地慢了)。
+                if terminal_opened && last_data.elapsed() >= QUIET_WARN && !quiet_logged {
+                    quiet_logged = true;
+                    log::debug!("no frame received for {:?}", last_data.elapsed());
+                }
+
+                // 「敲了却一个字节都不回来」是个和空闲截然不同的状态。
+                //
+                // 单纯的「远端很久没输出」不能报——停在提示符上的 shell 本来就
+                // 该是安静的。但我们刚发过输入、之后一个字节都没回来，那就只有
+                // 两种可能：远端的终端服务不动了，或者链路只是看着还活着。这两
+                // 者都不是本地渲染的锅，日志必须把这句话说出来，否则下次又要从
+                // 头猜一遍。
+                if terminal_opened {
+                    if let Some(sent) = last_input_at {
+                        // 写成 match 而不是 is_none_or：后者要 Rust 1.82，
+                        // 而 Cargo.toml 声明的 MSRV 是 1.75。
+                        let due = match quiet_reported_at {
+                            None => true,
+                            Some(t) => t.elapsed() >= QUIET_REPEAT,
+                        };
+                        if sent > last_data && sent.elapsed() >= QUIET_WARN && due {
+                            quiet_reported_at = Some(std::time::Instant::now());
+                            log::warn!(
+                                "已向远端发送输入 {:?}，期间没有收到任何输出；保活{}。这段静默在远端或链路，不是本地渲染。",
+                                sent.elapsed(),
+                                if pending_keepalive.is_some() {
+                                    "未收到回包"
+                                } else {
+                                    "正常"
+                                }
+                            );
+                        }
+                    }
+                }
+
+                // 尺寸以终端送来的 Resize 事件为准。轮询只作兜底，两秒一次——
+                // 万一某个终端不报事件，功能仍在，但不再是刷屏时的锁竞争来源。
+                if resize_target.is_none()
+                    && last_size_poll.elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    last_size_poll = std::time::Instant::now();
+                    stall::enter(stall::SIZE_QUERY);
+                    if let Ok((nc, nr)) = crossterm::terminal::size() {
+                        if (nc, nr) != (last_cols, last_rows) {
+                            resize_target = Some((nc, nr));
+                        }
+                    }
+                }
+
+                // 拖拽窗口会连着报很多次尺寸。逐次处理等于逐次整屏重画，
+                // 这里只认最后一个。
+                if let Some((nc, nr)) = resize_target.take() {
+                    let (nc, nr) = normalize_terminal_size(nc, nr);
+                    if (nc != last_cols || nr != last_rows) && terminal_opened {
+                        log::debug!("Resize: {}x{}", nc, nr);
+                        stall::enter(stall::REPAINT);
+                        let ask_redraw = screen.resize(nr, nc);
+                        let mut a = TerminalAction::new();
+                        a.set_resize(ResizeTerminal { terminal_id, rows: nr as u32, cols: nc as u32, ..Default::default() });
+                        let mut m = Message::new(); m.set_terminal_action(a);
+                        send_out!(m);
+                        if ask_redraw {
+                            // 先让远端知道新尺寸，再请它按新尺寸重画。
+                            let mut a = TerminalAction::new();
+                            a.set_data(TerminalData {
+                                terminal_id,
+                                data: vec![0x0c].into(),
+                                compressed: false,
+                                ..Default::default()
+                            });
+                            let mut m = Message::new(); m.set_terminal_action(a);
+                            send_out!(m);
+                        }
+                        last_cols = nc; last_rows = nr;
+                    }
+                }
+                let mut typed: Vec<u8> = Vec::new();
+                stall::enter(stall::INPUT);
+                while let Some(input) = pending_input.pop_front() {
+                    let ev = match input {
+                        Input::Key(k) => k,
+                        Input::Resize(c, r) => { resize_target = Some((c, r)); continue; }
+                        Input::Paste(text) => {
+                            if !terminal_opened { continue; }
+                            if screen.active() { screen.to_live(); screen.render(); }
+                            // Hand the remote a paste, not keystrokes. Apps that
+                            // asked for bracketed paste (Claude Code, vim, most
+                            // shells) use the markers to take the text
+                            // literally — without them a multi-line paste runs
+                            // line by line and indentation logic mangles it.
+                            // Terminals send CR for line breaks inside a paste.
+                            let body = text.replace("\r\n", "\r").replace('\n', "\r");
+                            let mut payload = Vec::with_capacity(body.len() + 12);
+                            payload.extend_from_slice(b"\x1b[200~");
+                            payload.extend_from_slice(body.as_bytes());
+                            payload.extend_from_slice(b"\x1b[201~");
+                            let input_bytes = payload.len();
+                            if input_backlog_exceeded(
+                                unanswered_input_messages,
+                                unanswered_input_bytes,
+                                input_bytes,
+                            ) && last_peer_activity.elapsed() >= std::time::Duration::from_secs(5) {
+                                log::warn!(
+                                    "远端长时间没有输出，丢弃粘贴输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
+                                    unanswered_input_messages,
+                                    unanswered_input_bytes,
+                                );
+                                continue;
+                            }
+                            let mut a = TerminalAction::new();
+                            a.set_data(TerminalData { terminal_id, data: payload.into(), compressed: false, ..Default::default() });
+                            let mut m = Message::new(); m.set_terminal_action(a);
+                            log::debug!("Input: queueing {} pasted bytes", body.len());
+                            last_input_at = Some(std::time::Instant::now());
+                            send_out!(m);
+                            unanswered_input_messages += 1;
+                            unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
+                            continue;
+                        }
+                    };
+                    // Insurance. The screen is drawn from a model of what the
+                    // terminal is showing, and that model can only be wrong if
+                    // something wrote to the terminal behind its back. There is
+                    // no way to read a terminal back to find out, so give the
+                    // user one key that throws the model's idea of the screen
+                    // away and paints it again from scratch.
+                    if ev.code == KeyCode::F(5) && ev.modifiers.contains(KeyModifiers::SHIFT) {
+                        screen.to_live();
+                        screen.repaint(true);
+                        continue;
+                    }
+                    // Scrollback navigation is handled locally and never
+                    // reaches the remote.
+                    if let Some(delta) = scrollback_key(&ev) {
+                        let changed = match delta {
+                            i32::MAX => screen.page(SCROLLBACK_LINES as i32),
+                            i32::MIN => { let was = screen.active(); screen.to_live(); was }
+                            d => screen.page(d),
+                        };
+                        if changed { screen.render(); }
+                        continue;
+                    }
+                    // Any other key resumes the live view, like a pager would.
+                    if screen.active() {
+                        screen.to_live();
+                        screen.render();
+                    }
+
+                    // Ctrl+V is the key an app on the far side reads an image
+                    // with, and it is the only chance we get: an image-only
+                    // clipboard produces no local paste event, so the image has
+                    // to be on the remote clipboard *before* the keystroke
+                    // arrives. Text pastes are unaffected — they come through
+                    // bracketed paste, and Ctrl+V still goes through either way.
+                    if matches!(ev.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
+                        && ev.modifiers.contains(KeyModifiers::CONTROL)
+                        && terminal_opened
+                    {
+                        // 诊断用：让 Ctrl+V 走合成图，把「会话进行中发送」这个
+                        // 变量单独隔离出来测。
+                        // arboard 读剪贴板是阻塞的 Win32 调用，别的进程占着剪贴板
+                        // 时它要等。卡在这里的话网络读和保活会一起停，所以单独标
+                        // 一个相位，好把它和渲染卡死区分开。
+                        stall::enter(stall::CLIPBOARD);
+                        let built = match std::env::var("RUSTSHELL_CLIP_TEST") {
+                            Ok(spec) => synthetic_clipboard_image(&spec),
+                            Err(_) => clipboard_image_message(),
+                        };
+                        stall::enter(stall::INPUT);
+                        match built {
+                            Ok((m, bytes, w, h)) => {
+                                log::debug!("clipboard image {w}x{h}, {bytes} bytes compressed");
+                                // 剪贴板发不出去不值得断开会话，只报一声。
+                                if let Err(e) = tx.try_send(m) {
+                                    screen.set_status(format!("clipboard: send failed: {e}"));
+                                } else {
+                                    screen.set_status(format!(
+                                        "clipboard: sent {w}x{h} image, {} KB — if nothing appears, the remote is RustDesk 1.4.9+ and drops it",
+                                        bytes / 1024
+                                    ));
+                                    // The remote applies the clipboard on its own
+                                    // thread, so the keystroke has to lag behind
+                                    // it or the app reads the old clipboard.
+                                    stall::enter(stall::CLIP_WAIT);
+                                    time::sleep(std::time::Duration::from_millis(200)).await;
+                                    stall::enter(stall::INPUT);
+                                }
+                            }
+                            // Say so rather than doing nothing. "Ctrl+V did not
+                            // work" has several possible causes and the user
+                            // cannot tell them apart from silence — a file
+                            // copied in Finder puts a path on the clipboard,
+                            // not an image, and reads the same as a failure.
+                            Err(e) => screen.set_status(format!("clipboard: {e:#}")),
+                        }
+                    }
+
+                    let data = key_event_to_bytes(ev.code, ev.modifiers);
+                    if data.is_empty() { continue; }
+                    let quit_byte = (quit_key.to_ascii_lowercase() as u8) - b'a' + 1;
+                    if data == [quit_byte] {
+                        // 默认关闭远端 shell；`--detach` 只释放本地连接，保留持久会话。
+                        // 正常关闭要等远端确认后才发送连接级收尾帧。
+                        if terminal_opened && !typed.is_empty() {
+                            let mut a = TerminalAction::new();
+                            a.set_data(TerminalData {
+                                terminal_id,
+                                data: std::mem::take(&mut typed).into(),
+                                compressed: false,
+                                ..Default::default()
+                            });
+                            let mut m = Message::new();
+                            m.set_terminal_action(a);
+                            tx.try_send(m).ok();
+                        }
+                        // 只有这一条路径是用户明确说「拆掉它」，也只有这一条还会
+                        // 发 CloseTerminal——而且要先确认链路还在应答保活。
+                        let may_close = may_close_remote(
+                            no_remote_close,
+                            pending_keepalive.map(|(_, sent_at)| sent_at.elapsed()),
+                        );
+                        if detach {
+                            log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
+                            finish_connection(tx, priority_tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
+                        } else if !may_close {
+                            log::warn!(
+                                "Quitting without closing the remote terminal: the link is not answering liveness probes. \
+                                 The shell stays on the remote; reconnect to the same slot to get it back."
+                            );
+                            finish_connection(tx, priority_tx, writer_task).await;
+                            return Ok(SessionEnd::UserQuit);
+                        } else {
+                            log::info!("Closing terminal (Ctrl+{})...", quit_key.to_ascii_uppercase());
+                            // Opened 尚未返回时也要排队关闭，防止快速关窗留下持久 shell。
+                            tx.try_send(close_terminal_message(terminal_id)).ok();
+                            quitting = true;
+                            close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
+                        }
+                        pending_input.clear();
+                        break;
+                    }
+                    // 攒起来，本轮结束一次发完。一个按键一条消息的话，打字
+                    // 快一点就是几十条消息背靠背挤过中继——实测会丢字，表现
+                    // 为「敲不进去」。
+                    typed.extend_from_slice(&data);
+                }
+
+                if terminal_opened && !typed.is_empty() {
+                    let input_bytes = typed.len();
+                    if input_backlog_exceeded(
+                        unanswered_input_messages,
+                        unanswered_input_bytes,
+                        input_bytes,
+                    ) && last_peer_activity.elapsed() >= std::time::Duration::from_secs(5) {
+                        log::warn!(
+                            "远端长时间没有输出，丢弃击键输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
+                            unanswered_input_messages,
+                            unanswered_input_bytes,
+                        );
+                        typed.clear();
+                        continue;
+                    }
+                    log::debug!("Input: queueing {} typed bytes", input_bytes);
+                    last_input_at = Some(std::time::Instant::now());
+                    let mut a = TerminalAction::new();
+                    a.set_data(TerminalData {
+                        terminal_id,
+                        data: std::mem::take(&mut typed).into(),
+                        compressed: false,
+                        ..Default::default()
+                    });
+                    let mut m = Message::new();
+                    m.set_terminal_action(a);
+                    send_out!(m);
+                    unanswered_input_messages += 1;
+                    unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
+                }
+            }
+
+            res = reader.next() => {
                 let bytes = match res {
                     Some(Ok(b)) => b,
                     // Both mean the transport died, not that the remote shell
@@ -3895,321 +4228,6 @@ async fn terminal_io_loop(
                 }
             }
 
-            _ = input_timer.tick(), if !quitting => {
-                last_maintenance = std::time::Instant::now();
-                // 写任务死了就等于链路断了。靠下一次发送去发现的话，空闲时要
-                // 等到 15 秒后的保活才知道；这里 20 毫秒就能察觉。
-                if writer_task.is_finished() {
-                    log::info!("Writer task ended, connection lost");
-                    finish_connection(tx, priority_tx, writer_task).await;
-                    return Ok(if quitting { SessionEnd::UserQuit } else { SessionEnd::Disconnected });
-                }
-
-                if let Some(since) = pending_since {
-                    if last_data.elapsed() >= SETTLE || since.elapsed() >= MAX_HOLD {
-                        let started = std::time::Instant::now();
-                        stall::enter(stall::FLUSH);
-                        screen.flush();
-                        if started.elapsed() >= SLOW_FLUSH {
-                            log::debug!("flush took {:?}", started.elapsed());
-                        }
-                        pending_since = None;
-                    }
-                }
-
-                // 丢过帧就一直重试整屏重画，直到本地终端喘过气来。间隔放宽到
-                // 200 毫秒：队列还满着的时候每 20 毫秒重造一屏纯属白烧 CPU，
-                // 而且只会让本来就堵着的队列更堵。
-                if screen.needs_repaint()
-                    && last_repaint_try.elapsed() >= std::time::Duration::from_millis(200)
-                {
-                    last_repaint_try = std::time::Instant::now();
-                    stall::enter(stall::REPAINT);
-                    screen.render();
-                }
-
-                // 卡死时日志的最后一行要能指认是哪一环:收不到帧了(远端或链路
-                // 堵了),还是收得到但画不出来(本地慢了)。
-                if terminal_opened && last_data.elapsed() >= QUIET_WARN && !quiet_logged {
-                    quiet_logged = true;
-                    log::debug!("no frame received for {:?}", last_data.elapsed());
-                }
-
-                // 「敲了却一个字节都不回来」是个和空闲截然不同的状态。
-                //
-                // 单纯的「远端很久没输出」不能报——停在提示符上的 shell 本来就
-                // 该是安静的。但我们刚发过输入、之后一个字节都没回来，那就只有
-                // 两种可能：远端的终端服务不动了，或者链路只是看着还活着。这两
-                // 者都不是本地渲染的锅，日志必须把这句话说出来，否则下次又要从
-                // 头猜一遍。
-                if terminal_opened {
-                    if let Some(sent) = last_input_at {
-                        // 写成 match 而不是 is_none_or：后者要 Rust 1.82，
-                        // 而 Cargo.toml 声明的 MSRV 是 1.75。
-                        let due = match quiet_reported_at {
-                            None => true,
-                            Some(t) => t.elapsed() >= QUIET_REPEAT,
-                        };
-                        if sent > last_data && sent.elapsed() >= QUIET_WARN && due {
-                            quiet_reported_at = Some(std::time::Instant::now());
-                            log::warn!(
-                                "已向远端发送输入 {:?}，期间没有收到任何输出；保活{}。这段静默在远端或链路，不是本地渲染。",
-                                sent.elapsed(),
-                                if pending_keepalive.is_some() {
-                                    "未收到回包"
-                                } else {
-                                    "正常"
-                                }
-                            );
-                        }
-                    }
-                }
-
-                // 尺寸以终端送来的 Resize 事件为准。轮询只作兜底，两秒一次——
-                // 万一某个终端不报事件，功能仍在，但不再是刷屏时的锁竞争来源。
-                if resize_target.is_none()
-                    && last_size_poll.elapsed() >= std::time::Duration::from_secs(2)
-                {
-                    last_size_poll = std::time::Instant::now();
-                    stall::enter(stall::SIZE_QUERY);
-                    if let Ok((nc, nr)) = crossterm::terminal::size() {
-                        if (nc, nr) != (last_cols, last_rows) {
-                            resize_target = Some((nc, nr));
-                        }
-                    }
-                }
-
-                // 拖拽窗口会连着报很多次尺寸。逐次处理等于逐次整屏重画，
-                // 这里只认最后一个。
-                if let Some((nc, nr)) = resize_target.take() {
-                    let (nc, nr) = normalize_terminal_size(nc, nr);
-                    if (nc != last_cols || nr != last_rows) && terminal_opened {
-                        log::debug!("Resize: {}x{}", nc, nr);
-                        stall::enter(stall::REPAINT);
-                        let ask_redraw = screen.resize(nr, nc);
-                        let mut a = TerminalAction::new();
-                        a.set_resize(ResizeTerminal { terminal_id, rows: nr as u32, cols: nc as u32, ..Default::default() });
-                        let mut m = Message::new(); m.set_terminal_action(a);
-                        send_out!(m);
-                        if ask_redraw {
-                            // 先让远端知道新尺寸，再请它按新尺寸重画。
-                            let mut a = TerminalAction::new();
-                            a.set_data(TerminalData {
-                                terminal_id,
-                                data: vec![0x0c].into(),
-                                compressed: false,
-                                ..Default::default()
-                            });
-                            let mut m = Message::new(); m.set_terminal_action(a);
-                            send_out!(m);
-                        }
-                        last_cols = nc; last_rows = nr;
-                    }
-                }
-                let mut typed: Vec<u8> = Vec::new();
-                stall::enter(stall::INPUT);
-                while let Some(input) = pending_input.pop_front() {
-                    let ev = match input {
-                        Input::Key(k) => k,
-                        Input::Resize(c, r) => { resize_target = Some((c, r)); continue; }
-                        Input::Paste(text) => {
-                            if !terminal_opened { continue; }
-                            if screen.active() { screen.to_live(); screen.render(); }
-                            // Hand the remote a paste, not keystrokes. Apps that
-                            // asked for bracketed paste (Claude Code, vim, most
-                            // shells) use the markers to take the text
-                            // literally — without them a multi-line paste runs
-                            // line by line and indentation logic mangles it.
-                            // Terminals send CR for line breaks inside a paste.
-                            let body = text.replace("\r\n", "\r").replace('\n', "\r");
-                            let mut payload = Vec::with_capacity(body.len() + 12);
-                            payload.extend_from_slice(b"\x1b[200~");
-                            payload.extend_from_slice(body.as_bytes());
-                            payload.extend_from_slice(b"\x1b[201~");
-                            let input_bytes = payload.len();
-                            if input_backlog_exceeded(
-                                unanswered_input_messages,
-                                unanswered_input_bytes,
-                                input_bytes,
-                            ) {
-                                log::warn!(
-                                    "远端长时间没有输出，停止发送输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
-                                    unanswered_input_messages,
-                                    unanswered_input_bytes,
-                                );
-                                finish_connection(tx, priority_tx, writer_task).await;
-                                return Ok(SessionEnd::Disconnected);
-                            }
-                            let mut a = TerminalAction::new();
-                            a.set_data(TerminalData { terminal_id, data: payload.into(), compressed: false, ..Default::default() });
-                            let mut m = Message::new(); m.set_terminal_action(a);
-                            log::debug!("Input: queueing {} pasted bytes", body.len());
-                            last_input_at = Some(std::time::Instant::now());
-                            send_out!(m);
-                            unanswered_input_messages += 1;
-                            unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
-                            continue;
-                        }
-                    };
-                    // Insurance. The screen is drawn from a model of what the
-                    // terminal is showing, and that model can only be wrong if
-                    // something wrote to the terminal behind its back. There is
-                    // no way to read a terminal back to find out, so give the
-                    // user one key that throws the model's idea of the screen
-                    // away and paints it again from scratch.
-                    if ev.code == KeyCode::F(5) && ev.modifiers.contains(KeyModifiers::SHIFT) {
-                        screen.to_live();
-                        screen.repaint(true);
-                        continue;
-                    }
-                    // Scrollback navigation is handled locally and never
-                    // reaches the remote.
-                    if let Some(delta) = scrollback_key(&ev) {
-                        let changed = match delta {
-                            i32::MAX => screen.page(SCROLLBACK_LINES as i32),
-                            i32::MIN => { let was = screen.active(); screen.to_live(); was }
-                            d => screen.page(d),
-                        };
-                        if changed { screen.render(); }
-                        continue;
-                    }
-                    // Any other key resumes the live view, like a pager would.
-                    if screen.active() {
-                        screen.to_live();
-                        screen.render();
-                    }
-
-                    // Ctrl+V is the key an app on the far side reads an image
-                    // with, and it is the only chance we get: an image-only
-                    // clipboard produces no local paste event, so the image has
-                    // to be on the remote clipboard *before* the keystroke
-                    // arrives. Text pastes are unaffected — they come through
-                    // bracketed paste, and Ctrl+V still goes through either way.
-                    if matches!(ev.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
-                        && ev.modifiers.contains(KeyModifiers::CONTROL)
-                        && terminal_opened
-                    {
-                        // 诊断用：让 Ctrl+V 走合成图，把「会话进行中发送」这个
-                        // 变量单独隔离出来测。
-                        // arboard 读剪贴板是阻塞的 Win32 调用，别的进程占着剪贴板
-                        // 时它要等。卡在这里的话网络读和保活会一起停，所以单独标
-                        // 一个相位，好把它和渲染卡死区分开。
-                        stall::enter(stall::CLIPBOARD);
-                        let built = match std::env::var("RUSTSHELL_CLIP_TEST") {
-                            Ok(spec) => synthetic_clipboard_image(&spec),
-                            Err(_) => clipboard_image_message(),
-                        };
-                        stall::enter(stall::INPUT);
-                        match built {
-                            Ok((m, bytes, w, h)) => {
-                                log::debug!("clipboard image {w}x{h}, {bytes} bytes compressed");
-                                // 剪贴板发不出去不值得断开会话，只报一声。
-                                if let Err(e) = tx.try_send(m) {
-                                    screen.set_status(format!("clipboard: send failed: {e}"));
-                                } else {
-                                    screen.set_status(format!(
-                                        "clipboard: sent {w}x{h} image, {} KB — if nothing appears, the remote is RustDesk 1.4.9+ and drops it",
-                                        bytes / 1024
-                                    ));
-                                    // The remote applies the clipboard on its own
-                                    // thread, so the keystroke has to lag behind
-                                    // it or the app reads the old clipboard.
-                                    stall::enter(stall::CLIP_WAIT);
-                                    time::sleep(std::time::Duration::from_millis(200)).await;
-                                    stall::enter(stall::INPUT);
-                                }
-                            }
-                            // Say so rather than doing nothing. "Ctrl+V did not
-                            // work" has several possible causes and the user
-                            // cannot tell them apart from silence — a file
-                            // copied in Finder puts a path on the clipboard,
-                            // not an image, and reads the same as a failure.
-                            Err(e) => screen.set_status(format!("clipboard: {e:#}")),
-                        }
-                    }
-
-                    let data = key_event_to_bytes(ev.code, ev.modifiers);
-                    if data.is_empty() { continue; }
-                    let quit_byte = (quit_key.to_ascii_lowercase() as u8) - b'a' + 1;
-                    if data == [quit_byte] {
-                        // 默认关闭远端 shell；`--detach` 只释放本地连接，保留持久会话。
-                        // 正常关闭要等远端确认后才发送连接级收尾帧。
-                        if terminal_opened && !typed.is_empty() {
-                            let mut a = TerminalAction::new();
-                            a.set_data(TerminalData {
-                                terminal_id,
-                                data: std::mem::take(&mut typed).into(),
-                                compressed: false,
-                                ..Default::default()
-                            });
-                            let mut m = Message::new();
-                            m.set_terminal_action(a);
-                            tx.try_send(m).ok();
-                        }
-                        // 只有这一条路径是用户明确说「拆掉它」，也只有这一条还会
-                        // 发 CloseTerminal——而且要先确认链路还在应答保活。
-                        let may_close = may_close_remote(
-                            no_remote_close,
-                            pending_keepalive.map(|(_, sent_at)| sent_at.elapsed()),
-                        );
-                        if detach {
-                            log::info!("Detaching (Ctrl+{}), remote session left running", quit_key.to_ascii_uppercase());
-                            finish_connection(tx, priority_tx, writer_task).await;
-                            return Ok(SessionEnd::UserQuit);
-                        } else if !may_close {
-                            log::warn!(
-                                "Quitting without closing the remote terminal: the link is not answering liveness probes. \
-                                 The shell stays on the remote; reconnect to the same slot to get it back."
-                            );
-                            finish_connection(tx, priority_tx, writer_task).await;
-                            return Ok(SessionEnd::UserQuit);
-                        } else {
-                            log::info!("Closing terminal (Ctrl+{})...", quit_key.to_ascii_uppercase());
-                            // Opened 尚未返回时也要排队关闭，防止快速关窗留下持久 shell。
-                            tx.try_send(close_terminal_message(terminal_id)).ok();
-                            quitting = true;
-                            close_timeout.as_mut().reset(time::Instant::now() + std::time::Duration::from_secs(2));
-                        }
-                        pending_input.clear();
-                        break;
-                    }
-                    // 攒起来，本轮结束一次发完。一个按键一条消息的话，打字
-                    // 快一点就是几十条消息背靠背挤过中继——实测会丢字，表现
-                    // 为「敲不进去」。
-                    typed.extend_from_slice(&data);
-                }
-
-                if terminal_opened && !typed.is_empty() {
-                    let input_bytes = typed.len();
-                    if input_backlog_exceeded(
-                        unanswered_input_messages,
-                        unanswered_input_bytes,
-                        input_bytes,
-                    ) {
-                        log::warn!(
-                            "远端长时间没有输出，停止发送输入以保护 RustDesk terminal 服务（{} 条、{} 字节未确认）",
-                            unanswered_input_messages,
-                            unanswered_input_bytes,
-                        );
-                        finish_connection(tx, priority_tx, writer_task).await;
-                        return Ok(SessionEnd::Disconnected);
-                    }
-                    log::debug!("Input: queueing {} typed bytes", input_bytes);
-                    last_input_at = Some(std::time::Instant::now());
-                    let mut a = TerminalAction::new();
-                    a.set_data(TerminalData {
-                        terminal_id,
-                        data: std::mem::take(&mut typed).into(),
-                        compressed: false,
-                        ..Default::default()
-                    });
-                    let mut m = Message::new();
-                    m.set_terminal_action(a);
-                    send_out!(m);
-                    unanswered_input_messages += 1;
-                    unanswered_input_bytes = unanswered_input_bytes.saturating_add(input_bytes);
-                }
-            }
         }
     }
     #[allow(unreachable_code)]
